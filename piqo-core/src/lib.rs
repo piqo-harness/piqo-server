@@ -6,4 +6,8 @@ mod session;
 
 pub use event_log::{EventId, EventLog, EventLogError, RecordedEvent, SemanticEvent};
 pub use permissions::{PermissionDecision, PermissionPolicy, PermissionRule, ToolRequest};
-pub use session::{AgentPhase, SessionPhase, SessionState, SessionTransitionError};
+pub use session::{
+    AgentPhase, ContentBlock, MessageAuthor, MessageProjection, MessageRole, PermissionProjection,
+    ProjectionError, RunProjection, RunStatus, SessionPhase, SessionProjection, SessionState,
+    SessionTransitionError,
+};

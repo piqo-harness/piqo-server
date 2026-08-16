@@ -1,7 +1,9 @@
 # piqo-server — objective and architecture
 
-Status: design. No code yet. This document records what the server is for and
-which decisions are already settled, so they do not get re-litigated.
+Status: implemented foundation. The workspace now contains the initial durable
+session core, SQLite event log, versioned HTTP/SSE API, and loopback-only CLI
+server. This document records what the server is for and which decisions are
+already settled, so they do not get re-litigated.
 
 ## What this is
 
@@ -201,8 +203,9 @@ crashing or inventing a call.
 **Tool runtime.** Native core tools plus MCP clients. Every invocation passes the
 permission evaluator first.
 
-**Storage.** Sessions and event logs. Engine choice is open; the requirement is
-cheap append and cheap range reads by event index.
+**Storage.** Sessions and event logs use SQLite through `sqlx`. The schema keeps
+append and range reads cheap, with a transactional projection cache verified
+against the append-only event log on startup.
 
 **HTTP API.** The product surface, since every UI is a client. Versioned from
 day one, streaming, with resume and fork as first-class operations rather than
@@ -220,6 +223,7 @@ for remote sessions. This is the single highest-risk surface in the project.
 - Event granularity — exact taxonomy, and which token-level data is persisted.
 - Context compaction — when to summarize, what to preserve. The most
   underestimated part of any harness.
-- Storage engine.
+- Storage alternatives are intentionally deferred until a second implementation
+  is needed; SQLite is the v1 concrete store.
 - Whether the permission evaluator's command parsing needs a real shell grammar
   or a restricted, explicitly-supported subset.

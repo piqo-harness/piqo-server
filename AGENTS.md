@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This repository is currently design-only. `ARCHITECTURE.md` is the source of truth for the planned Rust implementation; no `Cargo.toml`, source directory, or tests exist yet. The intended workspace will contain these crates:
+This repository contains the initial Rust implementation. `ARCHITECTURE.md` is the source of truth for the design and the workspace currently contains these crates:
 
 - `piqo-core/` — pure session state, permissions, and event-log domain logic.
 - `piqo-provider/` — outbound LLM HTTP/SSE transport and verbatim JSON body merging.
@@ -14,7 +14,7 @@ Keep IO at the crate edges. Preserve the dependency direction described in `ARCH
 
 ## Build, Test, and Development Commands
 
-No build or test commands are available until the Rust workspace is added. Once manifests exist, use the standard workflow from the repository root:
+Use the standard workflow from the repository root:
 
 ```sh
 cargo fmt --all -- --check
@@ -23,7 +23,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Run the CLI locally with `cargo run -p piqo-cli -- serve` after that package is implemented. Add project-specific commands here when they become authoritative.
+Run the CLI locally with `cargo run -p piqo-cli -- serve`. Add project-specific commands here when they become authoritative.
 
 ## Coding Style & Naming Conventions
 
