@@ -33,6 +33,7 @@ pub enum ProviderDelta {
         arguments: String,
     },
     ToolCallDelta {
+        index: Option<u64>,
         call_id: Option<String>,
         name: Option<String>,
         arguments: String,
@@ -197,6 +198,7 @@ fn parse_chat_event(
                         });
                     let delta = if streaming {
                         ProviderDelta::ToolCallDelta {
+                            index: call.get("index").and_then(Value::as_u64),
                             call_id,
                             name: function
                                 .and_then(|value| value.get("name"))

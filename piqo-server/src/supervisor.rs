@@ -32,6 +32,7 @@ impl EventHub {
 
     pub(crate) async fn subscribe(&self, session_id: &str) -> broadcast::Receiver<RecordedEvent> {
         let mut channels = self.channels.lock().await;
+        channels.retain(|_, sender| sender.receiver_count() > 0);
         channels
             .entry(session_id.to_owned())
             .or_insert_with(|| broadcast::channel(256).0)
@@ -47,6 +48,7 @@ impl EventHub {
         if should_remove {
             channels.remove(&event.session_id);
         }
+        channels.retain(|_, sender| sender.receiver_count() > 0);
     }
 
     pub(crate) async fn remove_if_unused(&self, session_id: &str) {
@@ -234,62 +236,79 @@ impl SessionSupervisor {
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
-        let _guard = lock.lock().await;
-        loop {
-            let projection = self.store.projection(session_id).await?;
-            if projection.queue_paused || projection.active_run().is_some() {
-                return Ok(());
-            }
-            let Some(mut run) = projection.queued_runs().next().cloned() else {
-                if projection.state.phase == SessionPhase::Running {
+        let guard = lock.lock().await;
+        let result = async {
+            loop {
+                let projection = self.store.projection(session_id).await?;
+                if projection.queue_paused || projection.active_run().is_some() {
+                    return Ok(());
+                }
+                let Some(mut run) = projection.queued_runs().next().cloned() else {
+                    if projection.state.phase == SessionPhase::Running {
+                        self.append(
+                            session_id,
+                            SemanticEvent::SessionPhaseChanged {
+                                from: SessionPhase::Running,
+                                to: SessionPhase::Finished,
+                                reason: Some("queue_empty".into()),
+                            },
+                        )
+                        .await?;
+                    }
+                    return Ok(());
+                };
+                if projection.state.phase != SessionPhase::Running {
                     self.append(
                         session_id,
                         SemanticEvent::SessionPhaseChanged {
-                            from: SessionPhase::Running,
-                            to: SessionPhase::Finished,
-                            reason: Some("queue_empty".into()),
+                            from: projection.state.phase,
+                            to: SessionPhase::Running,
+                            reason: Some("run_started".into()),
                         },
                     )
                     .await?;
                 }
-                return Ok(());
-            };
-            if projection.state.phase != SessionPhase::Running {
-                self.append(
-                    session_id,
-                    SemanticEvent::SessionPhaseChanged {
-                        from: projection.state.phase,
-                        to: SessionPhase::Running,
-                        reason: Some("run_started".into()),
-                    },
-                )
-                .await?;
-            }
-            let attempt_id = Uuid::now_v7().to_string();
-            let token = CancellationToken::new();
-            self.cancellations
-                .lock()
-                .await
-                .insert(run.run_id.clone(), token.clone());
-            if let Err(error) = self
-                .append(
-                    session_id,
-                    SemanticEvent::RunStarted {
-                        run_id: run.run_id.clone(),
-                        attempt_id: attempt_id.clone(),
-                        attempt: run.attempts + 1,
-                    },
-                )
-                .await
-            {
+                let attempt_id = Uuid::now_v7().to_string();
+                let token = CancellationToken::new();
+                self.cancellations
+                    .lock()
+                    .await
+                    .insert(run.run_id.clone(), token.clone());
+                if let Err(error) = self
+                    .append(
+                        session_id,
+                        SemanticEvent::RunStarted {
+                            run_id: run.run_id.clone(),
+                            attempt_id: attempt_id.clone(),
+                            attempt: run.attempts + 1,
+                        },
+                    )
+                    .await
+                {
+                    self.cancellations.lock().await.remove(&run.run_id);
+                    return Err(error);
+                }
+                run.attempt_id = Some(attempt_id);
+                run.attempts += 1;
+                let result = self.execute_run(session_id, &run, token, None, 0).await;
                 self.cancellations.lock().await.remove(&run.run_id);
-                return Err(error);
+                self.finish_run(session_id, &run, result).await?;
             }
-            run.attempt_id = Some(attempt_id);
-            run.attempts += 1;
-            let result = self.execute_run(session_id, &run, token, None, 0).await;
-            self.cancellations.lock().await.remove(&run.run_id);
-            self.finish_run(session_id, &run, result).await?;
+        }
+        .await;
+        drop(guard);
+        self.release_session_lock(session_id, &lock).await;
+        result
+    }
+
+    async fn release_session_lock(&self, session_id: &str, lock: &Arc<Mutex<()>>) {
+        let mut locks = self.locks.lock().await;
+        if Arc::strong_count(lock) == 2
+            && locks
+                .get(session_id)
+                .is_some_and(|current| Arc::ptr_eq(current, lock))
+        {
+            locks.remove(session_id);
         }
     }
 
@@ -309,7 +328,7 @@ impl SessionSupervisor {
             Ok(provider) => provider,
             Err(error) => return ExecutionResult::Failed(error.to_string(), false),
         };
-        let attempt_id = if retry_count == 0 {
+        let mut attempt_id = if retry_count == 0 {
             run.attempt_id
                 .clone()
                 .unwrap_or_else(|| Uuid::now_v7().to_string())
@@ -447,6 +466,21 @@ impl SessionSupervisor {
                         )
                         .await;
                     retries += 1;
+                    let next_attempt_id = Uuid::now_v7().to_string();
+                    if let Err(start_error) = self
+                        .append(
+                            session_id,
+                            SemanticEvent::RunAttemptStarted {
+                                run_id: run.run_id.clone(),
+                                attempt_id: next_attempt_id.clone(),
+                                attempt: run.attempts + u32::from(retries),
+                            },
+                        )
+                        .await
+                    {
+                        return ExecutionResult::Failed(start_error.to_string(), false);
+                    }
+                    attempt_id = next_attempt_id;
                     tokio::time::sleep(
                         std::time::Duration::from_millis(
                             250u64.saturating_mul(1u64 << (retries - 1)),
@@ -541,14 +575,18 @@ impl SessionSupervisor {
                                     saw_delta = true;
                                 }
                                 if let ProviderDelta::ToolCallDelta {
+                                    index,
                                     call_id,
                                     name,
                                     arguments,
                                 } = &delta
                                 {
-                                    let key = call_id.clone().unwrap_or_else(|| {
-                                        format!("anonymous-tool-{}", tool_buffers.len())
-                                    });
+                                    let key = index
+                                        .map(|index| format!("stream-index-{index}"))
+                                        .or_else(|| call_id.clone())
+                                        .unwrap_or_else(|| {
+                                            format!("anonymous-tool-{}", tool_buffers.len())
+                                        });
                                     let entry = tool_buffers.entry(key.clone()).or_insert_with(|| {
                                         ToolCallBuffer {
                                             call_id: call_id.clone(),
@@ -558,6 +596,9 @@ impl SessionSupervisor {
                                     });
                                     if entry.name.is_none() {
                                         entry.name = name.clone();
+                                    }
+                                    if entry.call_id.is_none() {
+                                        entry.call_id = call_id.clone();
                                     }
                                     entry.arguments.push_str(arguments);
                                     continue;

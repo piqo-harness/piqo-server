@@ -1,4 +1,4 @@
-use std::{path::Path, str::FromStr, time::Duration};
+use std::{collections::HashMap, path::Path, str::FromStr, sync::Arc, time::Duration};
 
 use chrono::{SecondsFormat, Utc};
 use piqo_core::{
@@ -11,6 +11,7 @@ use sqlx::{
     Row, SqlitePool,
 };
 use thiserror::Error;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 pub const EVENT_SCHEMA_VERSION: u16 = 1;
@@ -18,6 +19,7 @@ pub const EVENT_SCHEMA_VERSION: u16 = 1;
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
     pool: SqlitePool,
+    projection_cache: Arc<Mutex<HashMap<String, SessionProjection>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,7 +93,10 @@ impl SqliteStore {
             .connect_with(options)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            projection_cache: Arc::new(Mutex::new(HashMap::new())),
+        };
         store.validate_all().await?;
         Ok(store)
     }
@@ -174,8 +179,16 @@ impl SqliteStore {
     }
 
     pub async fn projection(&self, session_id: &str) -> Result<SessionProjection, StoreError> {
+        if let Some(projection) = self.projection_cache.lock().await.get(session_id).cloned() {
+            return Ok(projection);
+        }
         let events = self.events(session_id, 0, u32::MAX).await?;
-        project(session_id, &events)
+        let projection = project(session_id, &events)?;
+        self.projection_cache
+            .lock()
+            .await
+            .insert(session_id.to_owned(), projection.clone());
+        Ok(projection)
     }
 
     pub async fn list_sessions(
@@ -280,19 +293,24 @@ impl SqliteStore {
         if events.is_empty() {
             return Ok(Vec::new());
         }
+        let cached_projection = self.projection_cache.lock().await.get(session_id).cloned();
         let mut tx = self.pool.begin().await?;
-        let previous_rows = sqlx::query(
-            "SELECT event_id, schema_version, type, data, occurred_at
-             FROM events WHERE session_id = ? ORDER BY event_id ASC",
-        )
-        .bind(session_id)
-        .fetch_all(&mut *tx)
-        .await?;
-        let previous_events = previous_rows
-            .iter()
-            .map(|row| recorded_from_row(session_id, row))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut projection = project(session_id, &previous_events)?;
+        let mut projection = if let Some(projection) = cached_projection {
+            projection
+        } else {
+            let previous_rows = sqlx::query(
+                "SELECT event_id, schema_version, type, data, occurred_at
+                 FROM events WHERE session_id = ? ORDER BY event_id ASC",
+            )
+            .bind(session_id)
+            .fetch_all(&mut *tx)
+            .await?;
+            let previous_events = previous_rows
+                .iter()
+                .map(|row| recorded_from_row(session_id, row))
+                .collect::<Result<Vec<_>, _>>()?;
+            project(session_id, &previous_events)?
+        };
         let mut recorded = Vec::with_capacity(events.len());
         for event in events {
             let row = sqlx::query(
@@ -335,6 +353,10 @@ impl SqliteStore {
             });
         }
         tx.commit().await?;
+        self.projection_cache
+            .lock()
+            .await
+            .insert(session_id.to_owned(), projection);
         Ok(recorded)
     }
 

@@ -22,7 +22,7 @@ use axum::{
 };
 #[cfg(test)]
 use piqo_core::SemanticEvent;
-use piqo_core::{EventId, RecordedEvent, SessionPhase};
+use piqo_core::{EventId, RecordedEvent, RunProjection, RunStatus, SessionPhase};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -180,7 +180,36 @@ pub struct RunAcceptedResponse {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct RunResponse {
     pub session_id: String,
-    pub run: Value,
+    pub run: ApiRun,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct ApiRun {
+    pub run_id: String,
+    pub retry_of: Option<String>,
+    pub provider: String,
+    pub model: String,
+    pub request: Value,
+    pub status: String,
+    pub attempt_id: Option<String>,
+    pub attempts: u32,
+    pub error: Option<String>,
+}
+
+impl From<&RunProjection> for ApiRun {
+    fn from(run: &RunProjection) -> Self {
+        Self {
+            run_id: run.run_id.clone(),
+            retry_of: run.retry_of.clone(),
+            provider: run.provider.clone(),
+            model: run.model.clone(),
+            request: run.request.clone(),
+            status: run_status_name(run.status).to_owned(),
+            attempt_id: run.attempt_id.clone(),
+            attempts: run.attempts,
+            error: run.error.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -701,10 +730,7 @@ async fn get_run(
         .ok_or_else(|| ApiError::Store(StoreError::RunNotFound(run_id.clone())))?;
     Ok(Json(RunResponse {
         session_id,
-        run: serde_json::to_value(run).map_err(|error| ApiError::BadRequest {
-            code: "invalid_request",
-            message: error.to_string(),
-        })?,
+        run: ApiRun::from(run),
     }))
 }
 
@@ -783,6 +809,18 @@ fn session_phase_name(phase: SessionPhase) -> &'static str {
     }
 }
 
+fn run_status_name(status: RunStatus) -> &'static str {
+    match status {
+        RunStatus::Queued => "queued",
+        RunStatus::Running => "running",
+        RunStatus::RequiresAction => "requires_action",
+        RunStatus::Completed => "completed",
+        RunStatus::Failed => "failed",
+        RunStatus::Cancelled => "cancelled",
+        RunStatus::Interrupted => "interrupted",
+    }
+}
+
 fn event_for_sse(event: RecordedEvent) -> Event {
     match ApiEvent::try_from(event) {
         Ok(api_event) => {
@@ -830,6 +868,7 @@ fn event_for_sse(event: RecordedEvent) -> Event {
         CreateRunRequest,
         RunAcceptedResponse,
         RunResponse,
+        ApiRun,
         ProviderCatalogResponse
     )),
     tags((name = "sessions", description = "Durable session and event-log API"))
@@ -947,6 +986,53 @@ mod tests {
         let text = String::from_utf8(data.to_vec()).expect("SSE data is UTF-8");
         assert!(text.contains("id: 2"));
         assert!(text.contains("message_started"));
+    }
+
+    #[tokio::test]
+    async fn streams_an_event_appended_after_connection() {
+        let (app, state, _file) = app().await;
+        let session = state
+            .store
+            .create_session(None)
+            .await
+            .expect("session creates");
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/sessions/{}/events/stream", session.id))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+        let mut body = response.into_body();
+        state
+            .append_event(
+                &session.id,
+                SemanticEvent::MessageStarted {
+                    message_id: "live-message".into(),
+                    agent_id: String::new(),
+                    role: piqo_core::MessageRole::User,
+                    author: piqo_core::MessageAuthor::User,
+                },
+            )
+            .await
+            .expect("live event appends");
+        let mut saw_live = false;
+        for _ in 0..3 {
+            let frame = body
+                .frame()
+                .await
+                .expect("live SSE frame")
+                .expect("frame exists");
+            let data = frame.into_data().expect("SSE frame is data");
+            let text = String::from_utf8(data.to_vec()).expect("SSE data is UTF-8");
+            if text.contains("id: 2") && text.contains("live-message") {
+                saw_live = true;
+                break;
+            }
+        }
+        assert!(saw_live, "live event was not received");
     }
 
     #[tokio::test]
