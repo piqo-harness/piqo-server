@@ -1,0 +1,11 @@
+[package]
+name = "piqo-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+piqo-core = { path = "../piqo-core" }
+rmcp.workspace = true
+serde_json.workspace = true

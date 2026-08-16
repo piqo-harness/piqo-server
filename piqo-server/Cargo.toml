@@ -1,0 +1,17 @@
+[package]
+name = "piqo-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+axum.workspace = true
+piqo-core = { path = "../piqo-core" }
+piqo-provider = { path = "../piqo-provider" }
+piqo-tools = { path = "../piqo-tools" }
+serde.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+utoipa.workspace = true
