@@ -65,7 +65,7 @@ unauthenticated development mode.
 
 For the rationale and design constraints, see [ARCHITECTURE.md](ARCHITECTURE.md).
 Client implementers should follow the normative
-[client communication contract](CLIENT_PROTOCOL.md).
+[client communication contract](docs/CLIENT_PROTOCOL.md).
 
 ## Requirements
 
