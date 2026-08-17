@@ -13,6 +13,8 @@ use piqo_provider::{merge_request_bodies, ProviderDelta, ProviderProtocol, Provi
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, Mutex};
+use tokio::task::JoinSet;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -82,6 +84,8 @@ pub struct SessionSupervisor {
     locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     cancellations: Arc<Mutex<HashMap<String, CancellationToken>>>,
     dump_dir: Option<PathBuf>,
+    shutdown: CancellationToken,
+    workers: Arc<Mutex<JoinSet<()>>>,
 }
 
 impl SessionSupervisor {
@@ -91,6 +95,16 @@ impl SessionSupervisor {
         hub: EventHub,
         dump_dir: Option<PathBuf>,
     ) -> Self {
+        Self::with_dump_dir_and_shutdown(store, config, hub, dump_dir, CancellationToken::new())
+    }
+
+    pub(crate) fn with_dump_dir_and_shutdown(
+        store: SqliteStore,
+        config: Arc<PiqoConfig>,
+        hub: EventHub,
+        dump_dir: Option<PathBuf>,
+        shutdown: CancellationToken,
+    ) -> Self {
         Self {
             store,
             config,
@@ -99,7 +113,69 @@ impl SessionSupervisor {
             locks: Arc::new(Mutex::new(HashMap::new())),
             cancellations: Arc::new(Mutex::new(HashMap::new())),
             dump_dir,
+            shutdown,
+            workers: Arc::new(Mutex::new(JoinSet::new())),
         }
+    }
+
+    pub async fn shutdown(&self, grace: Duration) -> Result<(), StoreError> {
+        self.shutdown.cancel();
+        let mut workers = {
+            let mut tracked = self.workers.lock().await;
+            std::mem::take(&mut *tracked)
+        };
+        let workers_finished = timeout(grace, async {
+            while let Some(result) = workers.join_next().await {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "piqo worker task stopped during shutdown");
+                }
+            }
+        })
+        .await
+        .is_ok();
+        if !workers_finished {
+            workers.abort_all();
+            while let Some(result) = workers.join_next().await {
+                if let Err(error) = result {
+                    tracing::debug!(%error, "aborted piqo worker task");
+                }
+            }
+        }
+        self.interrupt_remaining_runs("server_shutdown").await?;
+        if !workers_finished {
+            return Err(StoreError::ShutdownTimeout);
+        }
+        Ok(())
+    }
+
+    async fn interrupt_remaining_runs(&self, reason: &str) -> Result<(), StoreError> {
+        let sessions = self.store.session_ids().await?;
+        for session_id in sessions {
+            let projection = self.store.projection(&session_id).await?;
+            let mut events = Vec::new();
+            for run in projection.runs.values().filter(|run| {
+                matches!(
+                    run.status,
+                    RunStatus::Queued | RunStatus::Running | RunStatus::RequiresAction
+                )
+            }) {
+                events.push(SemanticEvent::RunInterrupted {
+                    run_id: run.run_id.clone(),
+                    reason: reason.to_owned(),
+                });
+            }
+            if projection.state.phase == SessionPhase::Running {
+                events.push(SemanticEvent::SessionPhaseChanged {
+                    from: SessionPhase::Running,
+                    to: SessionPhase::Interrupted,
+                    reason: Some(reason.to_owned()),
+                });
+            }
+            if !events.is_empty() {
+                self.append_many(&session_id, events).await?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn queue_run(
@@ -107,6 +183,9 @@ impl SessionSupervisor {
         session_id: &str,
         request: RunRequest,
     ) -> Result<String, StoreError> {
+        if self.shutdown.is_cancelled() {
+            return Err(StoreError::ShuttingDown);
+        }
         self.store.get_session(session_id).await?;
         if self.store.projection(session_id).await?.queue_paused {
             return Err(StoreError::QueuePaused);
@@ -140,21 +219,27 @@ impl SessionSupervisor {
             },
         )
         .await?;
-        self.spawn_worker(session_id.to_owned());
+        self.spawn_worker(session_id.to_owned()).await;
         Ok(run_id)
     }
 
     pub async fn resume(&self, session_id: &str) -> Result<(), StoreError> {
+        if self.shutdown.is_cancelled() {
+            return Err(StoreError::ShuttingDown);
+        }
         let projection = self.store.projection(session_id).await?;
         if !projection.queue_paused {
             return Err(StoreError::QueueNotPaused);
         }
         self.append(session_id, SemanticEvent::QueueResumed).await?;
-        self.spawn_worker(session_id.to_owned());
+        self.spawn_worker(session_id.to_owned()).await;
         Ok(())
     }
 
     pub async fn cancel(&self, session_id: &str, run_id: &str) -> Result<(), StoreError> {
+        if self.shutdown.is_cancelled() {
+            return Err(StoreError::ShuttingDown);
+        }
         let projection = self.store.projection(session_id).await?;
         let run = projection
             .runs
@@ -186,6 +271,9 @@ impl SessionSupervisor {
     }
 
     pub async fn retry(&self, session_id: &str, run_id: &str) -> Result<String, StoreError> {
+        if self.shutdown.is_cancelled() {
+            return Err(StoreError::ShuttingDown);
+        }
         let projection = self.store.projection(session_id).await?;
         let run = projection
             .runs
@@ -215,13 +303,20 @@ impl SessionSupervisor {
             events.push(SemanticEvent::QueueResumed);
         }
         self.append_many(session_id, events).await?;
-        self.spawn_worker(session_id.to_owned());
+        self.spawn_worker(session_id.to_owned()).await;
         Ok(new_id)
     }
 
-    fn spawn_worker(&self, session_id: String) {
+    async fn spawn_worker(&self, session_id: String) {
+        if self.shutdown.is_cancelled() {
+            return;
+        }
         let this = self.clone();
-        tokio::spawn(async move {
+        let mut workers = self.workers.lock().await;
+        if self.shutdown.is_cancelled() {
+            return;
+        }
+        workers.spawn(async move {
             if let Err(error) = this.process_session(&session_id).await {
                 tracing::error!(%session_id, %error, "session worker stopped");
             }
@@ -239,6 +334,9 @@ impl SessionSupervisor {
         let guard = lock.lock().await;
         let result = async {
             loop {
+                if self.shutdown.is_cancelled() {
+                    return Ok(());
+                }
                 let projection = self.store.projection(session_id).await?;
                 if projection.queue_paused || projection.active_run().is_some() {
                     return Ok(());
@@ -446,6 +544,7 @@ impl SessionSupervisor {
             }
             let result = tokio::select! {
                 _ = cancellation.cancelled() => return ExecutionResult::Cancelled,
+                _ = self.shutdown.cancelled() => return ExecutionResult::Interrupted,
                 response = self.transport.send_with_connect_timeout(
                     request.try_clone().expect("JSON request is cloneable"),
                     Duration::from_secs(provider.connect_timeout_seconds),
@@ -481,13 +580,15 @@ impl SessionSupervisor {
                         return ExecutionResult::Failed(start_error.to_string(), false);
                     }
                     attempt_id = next_attempt_id;
-                    tokio::time::sleep(
-                        std::time::Duration::from_millis(
-                            250u64.saturating_mul(1u64 << (retries - 1)),
-                        )
-                        .min(std::time::Duration::from_secs(4)),
-                    )
-                    .await;
+                    tokio::select! {
+                        _ = self.shutdown.cancelled() => return ExecutionResult::Interrupted,
+                        _ = tokio::time::sleep(
+                            std::time::Duration::from_millis(
+                                250u64.saturating_mul(1u64 << (retries - 1)),
+                            )
+                            .min(std::time::Duration::from_secs(4)),
+                        ) => {}
+                    }
                 }
                 Err(error) => return ExecutionResult::Failed(error.to_string(), false),
             }
@@ -513,6 +614,7 @@ impl SessionSupervisor {
             loop {
                 tokio::select! {
                     _ = cancellation.cancelled() => return ExecutionResult::Cancelled,
+                    _ = self.shutdown.cancelled() => return ExecutionResult::Interrupted,
                     _ = flush_tick.tick() => {
                         if !text_buffer.is_empty() {
                             let buffered = std::mem::take(&mut text_buffer);
@@ -708,7 +810,12 @@ impl SessionSupervisor {
             }
             outcome
         } else {
-            match response.text().await {
+            let text_result = tokio::select! {
+                _ = cancellation.cancelled() => return ExecutionResult::Cancelled,
+                _ = self.shutdown.cancelled() => return ExecutionResult::Interrupted,
+                result = response.text() => result,
+            };
+            match text_result {
                 Ok(text) => {
                     match piqo_provider::parse_non_stream_response(provider.protocol, &text) {
                         Ok(deltas) => {
@@ -764,6 +871,9 @@ impl SessionSupervisor {
             }
         }
         if let ExecutionResult::Failed(error, true) = &result {
+            if self.shutdown.is_cancelled() {
+                return ExecutionResult::Interrupted;
+            }
             if retry_count < 5 {
                 let _ = self
                     .append(
@@ -776,11 +886,13 @@ impl SessionSupervisor {
                         },
                     )
                     .await;
-                tokio::time::sleep(
-                    Duration::from_millis(250u64.saturating_mul(1u64 << retry_count))
-                        .min(Duration::from_secs(4)),
-                )
-                .await;
+                tokio::select! {
+                    _ = self.shutdown.cancelled() => return ExecutionResult::Interrupted,
+                    _ = tokio::time::sleep(
+                        Duration::from_millis(250u64.saturating_mul(1u64 << retry_count))
+                            .min(Duration::from_secs(4)),
+                    ) => {}
+                }
                 return Box::pin(self.execute_run(
                     session_id,
                     run,
@@ -913,6 +1025,26 @@ impl SessionSupervisor {
                 )
                 .await?;
             }
+            ExecutionResult::Interrupted => {
+                self.interrupt_message(session_id).await?;
+                self.append(
+                    session_id,
+                    SemanticEvent::RunInterrupted {
+                        run_id: run.run_id.clone(),
+                        reason: "server_shutdown".into(),
+                    },
+                )
+                .await?;
+                self.append(
+                    session_id,
+                    SemanticEvent::SessionPhaseChanged {
+                        from: SessionPhase::Running,
+                        to: SessionPhase::Interrupted,
+                        reason: Some("server_shutdown".into()),
+                    },
+                )
+                .await?;
+            }
             ExecutionResult::RequiresAction => {
                 self.interrupt_message(session_id).await?;
                 self.append(
@@ -1026,6 +1158,7 @@ enum ExecutionResult {
     CompletedWithUsage(Option<Value>),
     Failed(String, bool),
     Cancelled,
+    Interrupted,
     RequiresAction,
 }
 
@@ -1134,5 +1267,164 @@ fn find_sse_frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
         (Some(lf), _) => Some((lf, 2)),
         (None, Some(crlf)) => Some((crlf, 4)),
         (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::NamedTempFile;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn shutdown_interrupts_an_active_provider_run_and_persists_the_reason() {
+        let file = NamedTempFile::new().expect("temporary sqlite file");
+        let store = SqliteStore::connect_file(file.path())
+            .await
+            .expect("store opens");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock provider binds");
+        let address = listener.local_addr().expect("mock provider address");
+        let provider_task = tokio::spawn(async move {
+            let (_connection, _) = listener.accept().await.expect("provider accepts");
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let config: PiqoConfig = toml::from_str(&format!(
+            "[providers.local]\nbase_url = \"http://{address}\"\n"
+        ))
+        .expect("provider config parses");
+        let hub = EventHub::new();
+        let supervisor = SessionSupervisor::with_dump_dir_and_shutdown(
+            store.clone(),
+            Arc::new(config),
+            hub,
+            None,
+            CancellationToken::new(),
+        );
+        let session = store.create_session(None).await.expect("session creates");
+        let run_id = supervisor
+            .queue_run(
+                &session.id,
+                RunRequest {
+                    provider: "local".into(),
+                    model: "test-model".into(),
+                    input: json!("hello"),
+                    agent: None,
+                    variant: None,
+                    body: json!({}),
+                },
+            )
+            .await
+            .expect("run queues");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let projection = store
+                    .projection(&session.id)
+                    .await
+                    .expect("projection loads");
+                if projection
+                    .runs
+                    .get(&run_id)
+                    .is_some_and(|run| run.status == RunStatus::Running)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("run starts");
+
+        supervisor
+            .shutdown(Duration::from_secs(2))
+            .await
+            .expect("shutdown completes");
+        let projection = store
+            .projection(&session.id)
+            .await
+            .expect("projection loads");
+        assert_eq!(projection.runs[&run_id].status, RunStatus::Interrupted);
+        assert_eq!(
+            projection.runs[&run_id].error.as_deref(),
+            Some("server_shutdown")
+        );
+        assert!(store
+            .events(&session.id, 0, u32::MAX)
+            .await
+            .expect("events load")
+            .iter()
+            .any(|event| matches!(
+                &event.event,
+                SemanticEvent::RunInterrupted { run_id: id, reason }
+                    if id == &run_id && reason == "server_shutdown"
+            )));
+        provider_task.abort();
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_queued_and_requires_action_runs() {
+        let file = NamedTempFile::new().expect("temporary sqlite file");
+        let store = SqliteStore::connect_file(file.path())
+            .await
+            .expect("store opens");
+        let session = store.create_session(None).await.expect("session creates");
+        store
+            .append_events(
+                &session.id,
+                vec![
+                    SemanticEvent::RunQueued {
+                        run_id: "queued".into(),
+                        retry_of: None,
+                        provider: "local".into(),
+                        model: "test".into(),
+                        request: json!({}),
+                    },
+                    SemanticEvent::RunQueued {
+                        run_id: "requires-action".into(),
+                        retry_of: None,
+                        provider: "local".into(),
+                        model: "test".into(),
+                        request: json!({}),
+                    },
+                    SemanticEvent::RunStarted {
+                        run_id: "requires-action".into(),
+                        attempt_id: "attempt".into(),
+                        attempt: 1,
+                    },
+                    SemanticEvent::RunRequiresAction {
+                        run_id: "requires-action".into(),
+                        call_ids: vec!["call".into()],
+                    },
+                ],
+            )
+            .await
+            .expect("events append");
+        let supervisor = SessionSupervisor::with_dump_dir(
+            store.clone(),
+            Arc::new(PiqoConfig::default()),
+            EventHub::new(),
+            None,
+        );
+
+        supervisor
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("shutdown completes");
+        let projection = store
+            .projection(&session.id)
+            .await
+            .expect("projection loads");
+        assert_eq!(projection.runs["queued"].status, RunStatus::Interrupted);
+        assert_eq!(
+            projection.runs["requires-action"].status,
+            RunStatus::Interrupted
+        );
+        assert!(projection
+            .runs
+            .values()
+            .all(|run| run.error.as_deref() == Some("server_shutdown")));
     }
 }

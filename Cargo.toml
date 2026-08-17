@@ -17,11 +17,14 @@ rust-version = "1.88"
 [workspace.dependencies]
 axum = "0.8"
 async-stream = "0.3"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["clock", "serde"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 eventsource-stream = "0.2.3"
+fs2 = "0.4"
 futures-core = "0.3"
 futures-util = "0.3"
+getrandom = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rmcp = { version = "3.1.2", default-features = false, features = ["client"] }
 serde = { version = "1", features = ["derive"] }

@@ -1,10 +1,19 @@
 //! HTTP/SSE API, session supervision, and durable SQLite storage.
 
 mod config;
+mod runtime;
 mod storage;
 mod supervisor;
 
-use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible,
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use async_stream::stream;
 use axum::{
@@ -13,9 +22,10 @@ use axum::{
         Request, State,
     },
     http::{HeaderMap, StatusCode},
+    middleware,
     response::{
         sse::{Event, KeepAlive, Sse},
-        IntoResponse, Json,
+        IntoResponse, Json, Response,
     },
     routing::{get, post},
     Router,
@@ -28,13 +38,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+use utoipa::{Modify, OpenApi, ToSchema};
 
 pub use config::{ConfigError, PiqoConfig, ProviderCatalogEntry, ProviderConfig};
+pub use runtime::{
+    ensure_private_directory, prepare_server, PreparedServer, ServerError, ServerOptions,
+};
 pub use storage::{SessionSummary, SqliteStore, StoreError, EVENT_SCHEMA_VERSION};
 use supervisor::EventHub;
 pub use supervisor::{RunRequest, SessionSupervisor};
+
+pub const API_VERSION: &str = "v1";
+pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Error)]
 #[error("piqo refuses non-loopback bind address {0} until authentication is configured")]
@@ -54,6 +72,27 @@ pub struct AppState {
     hub: EventHub,
     supervisor: SessionSupervisor,
     config: Arc<PiqoConfig>,
+    lifecycle: Arc<LifecycleState>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct LifecycleState {
+    shutting_down: AtomicBool,
+    streams_closed: CancellationToken,
+}
+
+impl LifecycleState {
+    fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+    }
+
+    fn close_streams(&self) {
+        self.streams_closed.cancel();
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Acquire)
+    }
 }
 
 impl AppState {
@@ -78,6 +117,30 @@ impl AppState {
             hub,
             supervisor,
             config,
+            lifecycle: Arc::new(LifecycleState::default()),
+        }
+    }
+
+    pub(crate) fn with_config_and_dump_and_shutdown(
+        store: SqliteStore,
+        config: Arc<PiqoConfig>,
+        dump_dir: Option<std::path::PathBuf>,
+        shutdown: CancellationToken,
+    ) -> Self {
+        let hub = EventHub::new();
+        let supervisor = SessionSupervisor::with_dump_dir_and_shutdown(
+            store.clone(),
+            config.clone(),
+            hub.clone(),
+            dump_dir,
+            shutdown,
+        );
+        Self {
+            store,
+            hub,
+            supervisor,
+            config,
+            lifecycle: Arc::new(LifecycleState::default()),
         }
     }
 
@@ -106,6 +169,10 @@ impl AppState {
 
     async fn subscribe(&self, session_id: &str) -> tokio::sync::broadcast::Receiver<RecordedEvent> {
         self.hub.subscribe(session_id).await
+    }
+
+    pub(crate) fn lifecycle(&self) -> Arc<LifecycleState> {
+        self.lifecycle.clone()
     }
 }
 
@@ -268,6 +335,8 @@ pub struct ErrorBody {
 #[derive(Debug, Serialize, ToSchema)]
 struct HealthResponse {
     status: &'static str,
+    server_version: &'static str,
+    api_version: &'static str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -402,6 +471,16 @@ impl IntoResponse for ApiError {
                 "conflict",
                 "session queue is not paused".to_owned(),
             ),
+            Self::Store(StoreError::ShuttingDown) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_shutting_down",
+                "server is shutting down".to_owned(),
+            ),
+            Self::Store(StoreError::ShutdownTimeout) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_shutdown_timeout",
+                "server shutdown timed out".to_owned(),
+            ),
             Self::Store(StoreError::RunNotFound(id)) => (
                 StatusCode::NOT_FOUND,
                 "run_not_found",
@@ -441,7 +520,12 @@ impl IntoResponse for ApiError {
 
 /// Build the complete versioned HTTP surface around a durable store.
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    router_with_token(state, None)
+}
+
+pub fn router_with_token(state: AppState, token: Option<String>) -> Router {
+    let lifecycle = state.lifecycle();
+    let mut router = Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/openapi.json", get(openapi))
         .route("/api/v1/sessions", post(create_session).get(list_sessions))
@@ -471,6 +555,78 @@ pub fn router(state: AppState) -> Router {
         .method_not_allowed_fallback(api_method_not_allowed)
         .fallback(api_not_found)
         .with_state(state)
+        .layer(middleware::from_fn(
+            move |request: Request, next: middleware::Next| {
+                let lifecycle = lifecycle.clone();
+                async move {
+                    if lifecycle.is_shutting_down() {
+                        return shutting_down_response();
+                    }
+                    next.run(request).await
+                }
+            },
+        ));
+    if let Some(token) = token {
+        let expected = Arc::<str>::from(token);
+        router = router.layer(middleware::from_fn(
+            move |request: Request, next: middleware::Next| {
+                let expected = expected.clone();
+                async move { authenticate_request(request, next, expected).await }
+            },
+        ));
+    }
+    router
+}
+
+fn shutting_down_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse {
+            error: ErrorBody {
+                code: "server_shutting_down".to_owned(),
+                message: "server is shutting down".to_owned(),
+            },
+        }),
+    )
+        .into_response()
+}
+
+async fn authenticate_request(
+    request: Request,
+    next: middleware::Next,
+    expected: Arc<str>,
+) -> Response {
+    let authorized = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|candidate| constant_time_equal(candidate.as_bytes(), expected.as_bytes()));
+    if authorized {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
+            Json(ErrorResponse {
+                error: ErrorBody {
+                    code: "unauthorized".to_owned(),
+                    message: "a valid bearer token is required".to_owned(),
+                },
+            }),
+        )
+            .into_response()
+    }
+}
+
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    let length = left.len().max(right.len());
+    let mut difference = left.len() ^ right.len();
+    for index in 0..length {
+        difference |= usize::from(left.get(index).copied().unwrap_or_default())
+            ^ usize::from(right.get(index).copied().unwrap_or_default());
+    }
+    difference == 0
 }
 
 async fn api_not_found() -> impl IntoResponse {
@@ -499,7 +655,11 @@ async fn api_method_not_allowed() -> impl IntoResponse {
 
 #[utoipa::path(get, path = "/api/v1/health", responses((status = 200, body = HealthResponse)))]
 async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse { status: "ok" })
+    Json(HealthResponse {
+        status: "ok",
+        server_version: SERVER_VERSION,
+        api_version: API_VERSION,
+    })
 }
 
 #[utoipa::path(
@@ -612,7 +772,9 @@ async fn stream_events(
             }
         }
         loop {
-            match receiver.recv().await {
+            tokio::select! {
+                _ = state.lifecycle.streams_closed.cancelled() => break,
+                result = receiver.recv() => match result {
                 Ok(recorded) if recorded.id > last_id => {
                     last_id = recorded.id;
                     yield Ok(event_for_sse(recorded));
@@ -632,6 +794,7 @@ async fn stream_events(
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
+                }
             }
         }
         state.hub.remove_if_unused(&session_id).await;
@@ -841,6 +1004,8 @@ fn event_for_sse(event: RecordedEvent) -> Event {
 
 #[derive(OpenApi)]
 #[openapi(
+    modifiers(&SecurityAddon),
+    security(("bearerAuth" = [])),
     paths(
         health,
         create_session,
@@ -875,6 +1040,24 @@ fn event_for_sse(event: RecordedEvent) -> Event {
 )]
 pub struct ApiDoc;
 
+struct SecurityAddon;
+
+impl Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        if let Some(components) = openapi.components.as_mut() {
+            components.add_security_scheme(
+                "bearerAuth",
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .bearer_format("base64url")
+                        .build(),
+                ),
+            );
+        }
+    }
+}
+
 async fn openapi() -> Json<utoipa::openapi::OpenApi> {
     Json(ApiDoc::openapi())
 }
@@ -895,6 +1078,57 @@ mod tests {
             .expect("store opens");
         let state = AppState::new(store);
         (router(state.clone()), state, file)
+    }
+
+    async fn authenticated_app() -> (Router, NamedTempFile) {
+        let file = NamedTempFile::new().expect("temporary sqlite file");
+        let store = SqliteStore::connect_file(file.path())
+            .await
+            .expect("store opens");
+        let state = AppState::new(store);
+        (router_with_token(state, Some("secret-token".into())), file)
+    }
+
+    #[tokio::test]
+    async fn protects_every_route_with_the_bearer_token() {
+        let (app, _file) = authenticated_app().await;
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()["www-authenticate"], "Bearer");
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/openapi.json")
+                    .header("authorization", "Bearer wrong-token")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/health")
+                    .header("authorization", "Bearer secret-token")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -943,6 +1177,8 @@ mod tests {
             .to_bytes();
         let document: Value = serde_json::from_slice(&body).expect("openapi decodes");
         assert!(document["paths"]["/api/v1/sessions"].is_object());
+        assert!(document["components"]["securitySchemes"]["bearerAuth"].is_object());
+        assert_eq!(document["security"][0]["bearerAuth"], serde_json::json!([]));
     }
 
     #[tokio::test]

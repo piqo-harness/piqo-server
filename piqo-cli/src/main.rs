@@ -9,10 +9,9 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
-use piqo_server::{AppState, PiqoConfig, RunRequest, SqliteStore};
+use piqo_server::{prepare_server, RunRequest, ServerOptions};
 use reqwest::Client;
 use serde_json::{json, Value};
-use tokio::net::TcpListener;
 
 #[derive(Debug, Parser)]
 #[command(name = "piqo", about = "Headless agent harness server")]
@@ -39,6 +38,8 @@ enum Command {
         session_id: String,
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         server: String,
+        #[arg(long, env = "PIQO_SERVER_TOKEN")]
+        token: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -49,6 +50,8 @@ enum Command {
         server: String,
         #[arg(long)]
         session: Option<String>,
+        #[arg(long, env = "PIQO_SERVER_TOKEN")]
+        token: Option<String>,
         #[arg(long, default_value = "omlx")]
         provider: String,
         #[arg(long)]
@@ -60,7 +63,10 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .init();
 
     match Cli::parse().command {
         Command::Serve {
@@ -69,44 +75,61 @@ async fn main() -> Result<()> {
             config,
             dump_requests,
         } => {
-            piqo_server::validate_bind_address(bind)?;
             let config_path = config.unwrap_or_else(default_config_path);
-            let config = PiqoConfig::load(&config_path)
-                .with_context(|| format!("loading configuration {}", config_path.display()))?;
             if let Some(directory) = &dump_requests {
                 tracing::warn!(path = %directory.display(), "request dumps may contain sensitive prompts");
             }
-            let store = SqliteStore::connect(&database).await?;
-            let recovered = store.recover_running_sessions().await?;
-            if !recovered.is_empty() {
-                tracing::info!(
-                    sessions = recovered.len(),
-                    "marked sessions interrupted after restart"
-                );
+            let prepared = prepare_server(ServerOptions {
+                bind,
+                database,
+                config: config_path.clone(),
+                dump_requests,
+                auth_token: None,
+                instance_lock: None,
+                shutdown_timeout: Duration::from_secs(10),
+            })
+            .await
+            .with_context(|| {
+                format!(
+                    "starting server with configuration {}",
+                    config_path.display()
+                )
+            })?;
+            tracing::info!(address = %prepared.local_addr()?, config = %config_path.display(), "piqo server listening");
+            let shutdown = prepared.shutdown_token();
+            let run = prepared.run();
+            tokio::pin!(run);
+            tokio::select! {
+                result = &mut run => result?,
+                _ = tokio::signal::ctrl_c() => {
+                    shutdown.cancel();
+                    run.await?;
+                }
             }
-            let listener = TcpListener::bind(bind).await?;
-            tracing::info!(address = %bind, config = %config_path.display(), "piqo server listening");
-            axum::serve(
-                listener,
-                piqo_server::router(AppState::with_config_and_dump(
-                    store,
-                    std::sync::Arc::new(config),
-                    dump_requests,
-                )),
-            )
-            .await?;
         }
         Command::Attach {
             session_id,
             server,
+            token,
             json,
         } => {
-            follow_events(&Client::new(), &server, &session_id, 0, json, None).await?;
+            let token = token.or_else(|| std::env::var("PIQO_SERVER_TOKEN").ok());
+            follow_events(
+                &Client::new(),
+                &server,
+                &session_id,
+                0,
+                json,
+                None,
+                token.as_deref(),
+            )
+            .await?;
         }
         Command::Run {
             prompt,
             server,
             session,
+            token,
             provider,
             model,
             json: json_output,
@@ -114,11 +137,15 @@ async fn main() -> Result<()> {
             let client = Client::builder()
                 .connect_timeout(Duration::from_secs(10))
                 .build()?;
+            let token = token.or_else(|| std::env::var("PIQO_SERVER_TOKEN").ok());
             let session_id = match session {
                 Some(id) => id,
                 None => {
-                    let response = client
-                        .post(format!("{server}/api/v1/sessions"))
+                    let mut request = client.post(format!("{server}/api/v1/sessions"));
+                    if let Some(token) = token.as_deref() {
+                        request = request.bearer_auth(token);
+                    }
+                    let response = request
                         .json(&json!({}))
                         .send()
                         .await
@@ -131,8 +158,11 @@ async fn main() -> Result<()> {
                         .to_owned()
                 }
             };
-            let response = client
-                .post(format!("{server}/api/v1/sessions/{session_id}/runs"))
+            let mut request = client.post(format!("{server}/api/v1/sessions/{session_id}/runs"));
+            if let Some(token) = token.as_deref() {
+                request = request.bearer_auth(token);
+            }
+            let response = request
                 .json(&RunRequest {
                     provider,
                     model,
@@ -150,7 +180,16 @@ async fn main() -> Result<()> {
             let run_id = accepted["run_id"]
                 .as_str()
                 .context("daemon response has no run id")?;
-            follow_events(&client, &server, &session_id, 0, json_output, Some(run_id)).await?;
+            follow_events(
+                &client,
+                &server,
+                &session_id,
+                0,
+                json_output,
+                Some(run_id),
+                token.as_deref(),
+            )
+            .await?;
         }
     }
     Ok(())
@@ -163,16 +202,21 @@ async fn follow_events(
     after: u64,
     json_output: bool,
     until_run: Option<&str>,
+    token: Option<&str>,
 ) -> Result<()> {
     let mut last_seen = after;
     let mut assistant_messages = HashSet::new();
     let mut active_run_seen = until_run.is_none();
     loop {
-        let response = client
+        let mut request = client
             .get(format!(
                 "{server}/api/v1/sessions/{session_id}/events/stream"
             ))
-            .header("Last-Event-ID", last_seen.to_string())
+            .header("Last-Event-ID", last_seen.to_string());
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        let response = request
             .send()
             .await
             .context("connecting to piqo event stream")?

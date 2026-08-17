@@ -74,6 +74,10 @@ pub enum StoreError {
     ProviderUnavailable(String),
     #[error("provider protocol error: {0}")]
     ProviderProtocolError(String),
+    #[error("server is shutting down")]
+    ShuttingDown,
+    #[error("server shutdown timed out while workers were active")]
+    ShutdownTimeout,
 }
 
 impl SqliteStore {
@@ -234,6 +238,12 @@ impl SqliteStore {
             None
         };
         Ok((summaries, next))
+    }
+
+    pub(crate) async fn session_ids(&self) -> Result<Vec<String>, StoreError> {
+        Ok(sqlx::query_scalar("SELECT id FROM sessions ORDER BY id")
+            .fetch_all(&self.pool)
+            .await?)
     }
 
     pub async fn events(
