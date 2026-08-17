@@ -1,7 +1,10 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentPhase {
     Created,
     Running,
@@ -11,11 +14,38 @@ pub enum AgentPhase {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SessionPhase {
     Created,
     Running,
+    Interrupted,
     Finished,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageRole {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum MessageAuthor {
+    System,
+    User,
+    Agent(String),
+    Tool(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum ContentBlock {
+    Text(String),
+    Json(serde_json::Value),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +53,63 @@ pub struct SessionState {
     pub session_id: String,
     pub phase: SessionPhase,
     pub revision: u64,
+    pub last_event_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStatus {
+    Queued,
+    Running,
+    RequiresAction,
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MessageProjection {
+    pub message_id: String,
+    pub role: MessageRole,
+    pub agent_id: Option<String>,
+    pub author: MessageAuthor,
+    pub blocks: Vec<ContentBlock>,
+    pub completed: bool,
+    pub interrupted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunProjection {
+    pub run_id: String,
+    pub retry_of: Option<String>,
+    pub provider: String,
+    pub model: String,
+    pub request: serde_json::Value,
+    pub status: RunStatus,
+    pub attempt_id: Option<String>,
+    pub attempts: u32,
+    pub error: Option<String>,
+    pub queue_priority: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionProjection {
+    pub request_id: String,
+    pub call_id: Option<String>,
+    pub agent_id: String,
+    pub tool_name: String,
+    pub arguments: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionProjection {
+    pub state: SessionState,
+    pub messages: Vec<MessageProjection>,
+    pub agents: BTreeMap<String, AgentPhase>,
+    pub pending_permissions: BTreeMap<String, PermissionProjection>,
+    pub runs: BTreeMap<String, RunProjection>,
+    pub queue_paused: bool,
 }
 
 impl SessionState {
@@ -31,21 +118,42 @@ impl SessionState {
             session_id: session_id.into(),
             phase: SessionPhase::Created,
             revision: 0,
+            last_event_id: None,
         }
     }
 
     pub fn start(&mut self) -> Result<(), SessionTransitionError> {
-        self.transition(SessionPhase::Running, &[SessionPhase::Created])
+        self.transition(
+            SessionPhase::Running,
+            &[
+                SessionPhase::Created,
+                SessionPhase::Finished,
+                SessionPhase::Interrupted,
+                SessionPhase::Failed,
+            ],
+        )
     }
 
     pub fn finish(&mut self) -> Result<(), SessionTransitionError> {
         self.transition(SessionPhase::Finished, &[SessionPhase::Running])
     }
 
+    pub fn interrupt(&mut self) -> Result<(), SessionTransitionError> {
+        self.transition(SessionPhase::Interrupted, &[SessionPhase::Running])
+    }
+
+    pub fn resume(&mut self) -> Result<(), SessionTransitionError> {
+        self.start()
+    }
+
     pub fn fail(&mut self) -> Result<(), SessionTransitionError> {
         self.transition(
             SessionPhase::Failed,
-            &[SessionPhase::Created, SessionPhase::Running],
+            &[
+                SessionPhase::Created,
+                SessionPhase::Running,
+                SessionPhase::Interrupted,
+            ],
         )
     }
 
@@ -64,6 +172,333 @@ impl SessionState {
         self.revision += 1;
         Ok(())
     }
+
+    pub fn apply(
+        &mut self,
+        event_id: u64,
+        event: &crate::SemanticEvent,
+    ) -> Result<(), ProjectionError> {
+        match event {
+            crate::SemanticEvent::SessionCreated { .. } => {
+                if self.revision != 0 || self.last_event_id.is_some() {
+                    return Err(ProjectionError::DuplicateCreation);
+                }
+            }
+            crate::SemanticEvent::SessionPhaseChanged { from, to, .. } => {
+                if self.phase != *from {
+                    return Err(ProjectionError::InvalidTransition(SessionTransitionError {
+                        from: self.phase,
+                        to: *to,
+                    }));
+                }
+                self.transition(*to, allowed_sources(*to))?;
+            }
+            crate::SemanticEvent::SessionInterrupted { .. } => self.interrupt()?,
+            crate::SemanticEvent::SessionForked { .. } => {
+                self.phase = SessionPhase::Interrupted;
+                self.revision += 1;
+            }
+            _ => {}
+        }
+        self.last_event_id = Some(event_id);
+        Ok(())
+    }
+}
+
+impl SessionProjection {
+    pub fn new(session_id: impl Into<String>) -> Self {
+        Self {
+            state: SessionState::new(session_id),
+            messages: Vec::new(),
+            agents: BTreeMap::new(),
+            pending_permissions: BTreeMap::new(),
+            runs: BTreeMap::new(),
+            queue_paused: false,
+        }
+    }
+
+    pub fn apply(
+        &mut self,
+        event_id: u64,
+        event: &crate::SemanticEvent,
+    ) -> Result<(), ProjectionError> {
+        self.state.apply(event_id, event)?;
+        match event {
+            crate::SemanticEvent::MessageStarted {
+                message_id,
+                agent_id,
+                role,
+                author,
+            } => {
+                if self
+                    .messages
+                    .iter()
+                    .any(|message| message.message_id == *message_id)
+                {
+                    return Err(ProjectionError::DuplicateMessage(message_id.clone()));
+                }
+                let projected_author = match (author, role, agent_id.is_empty()) {
+                    (MessageAuthor::System, MessageRole::User, _) => MessageAuthor::User,
+                    (MessageAuthor::System, MessageRole::Assistant, false) => {
+                        MessageAuthor::Agent(agent_id.clone())
+                    }
+                    (MessageAuthor::System, MessageRole::Tool, false) => {
+                        MessageAuthor::Tool(agent_id.clone())
+                    }
+                    _ => author.clone(),
+                };
+                self.messages.push(MessageProjection {
+                    message_id: message_id.clone(),
+                    role: *role,
+                    agent_id: (!agent_id.is_empty()).then(|| agent_id.clone()),
+                    author: projected_author,
+                    blocks: Vec::new(),
+                    completed: false,
+                    interrupted: false,
+                });
+            }
+            crate::SemanticEvent::MessageContentAppended { message_id, block } => {
+                let message = self
+                    .messages
+                    .iter_mut()
+                    .find(|message| message.message_id == *message_id)
+                    .ok_or_else(|| ProjectionError::UnknownMessage(message_id.clone()))?;
+                if message.completed || message.interrupted {
+                    return Err(ProjectionError::MessageAlreadyClosed(message_id.clone()));
+                }
+                message.blocks.push(block.clone());
+            }
+            crate::SemanticEvent::MessageCompleted { message_id } => {
+                let message = self
+                    .messages
+                    .iter_mut()
+                    .find(|message| message.message_id == *message_id)
+                    .ok_or_else(|| ProjectionError::UnknownMessage(message_id.clone()))?;
+                if message.completed || message.interrupted {
+                    return Err(ProjectionError::MessageAlreadyClosed(message_id.clone()));
+                }
+                message.completed = true;
+            }
+            crate::SemanticEvent::MessageInterrupted { message_id } => {
+                let message = self
+                    .messages
+                    .iter_mut()
+                    .find(|message| message.message_id == *message_id)
+                    .ok_or_else(|| ProjectionError::UnknownMessage(message_id.clone()))?;
+                if message.completed || message.interrupted {
+                    return Err(ProjectionError::MessageAlreadyClosed(message_id.clone()));
+                }
+                message.interrupted = true;
+            }
+            crate::SemanticEvent::AgentSpawned { agent_id, .. } => {
+                if self
+                    .agents
+                    .insert(agent_id.clone(), AgentPhase::Created)
+                    .is_some()
+                {
+                    return Err(ProjectionError::DuplicateAgent(agent_id.clone()));
+                }
+            }
+            crate::SemanticEvent::AgentPhaseChanged { agent_id, phase } => {
+                self.agents.insert(agent_id.clone(), *phase);
+            }
+            crate::SemanticEvent::AgentFinished { agent_id } => {
+                self.agents.insert(agent_id.clone(), AgentPhase::Finished);
+            }
+            crate::SemanticEvent::PermissionRequested {
+                request_id,
+                call_id,
+                agent_id,
+                tool_name,
+                arguments,
+            } => {
+                self.pending_permissions.insert(
+                    request_id.clone(),
+                    PermissionProjection {
+                        request_id: request_id.clone(),
+                        call_id: call_id.clone(),
+                        agent_id: agent_id.clone(),
+                        tool_name: tool_name.clone(),
+                        arguments: arguments.clone(),
+                    },
+                );
+            }
+            crate::SemanticEvent::PermissionResolved { request_id, .. } => {
+                self.pending_permissions.remove(request_id);
+            }
+            crate::SemanticEvent::RunQueued {
+                run_id,
+                retry_of,
+                provider,
+                model,
+                request,
+            } => {
+                if self.runs.contains_key(run_id) {
+                    return Err(ProjectionError::DuplicateRun(run_id.clone()));
+                }
+                self.runs.insert(
+                    run_id.clone(),
+                    RunProjection {
+                        run_id: run_id.clone(),
+                        retry_of: retry_of.clone(),
+                        provider: provider.clone(),
+                        model: model.clone(),
+                        request: request.clone(),
+                        status: RunStatus::Queued,
+                        attempt_id: None,
+                        attempts: 0,
+                        error: None,
+                        queue_priority: if retry_of.is_some() { -1 } else { 0 },
+                    },
+                );
+            }
+            crate::SemanticEvent::RunStarted {
+                run_id,
+                attempt_id,
+                attempt,
+            } => {
+                let run = self
+                    .runs
+                    .get_mut(run_id)
+                    .ok_or_else(|| ProjectionError::UnknownRun(run_id.clone()))?;
+                if run.status != RunStatus::Queued {
+                    return Err(ProjectionError::InvalidRunTransition {
+                        run_id: run_id.clone(),
+                        from: run.status,
+                        to: RunStatus::Running,
+                    });
+                }
+                run.status = RunStatus::Running;
+                run.attempt_id = Some(attempt_id.clone());
+                run.attempts = *attempt;
+            }
+            crate::SemanticEvent::RunCompleted { run_id, .. } => {
+                self.set_run_terminal(run_id, RunStatus::Completed, None)?;
+            }
+            crate::SemanticEvent::RunAttemptStarted {
+                run_id,
+                attempt_id,
+                attempt,
+            } => {
+                let run = self
+                    .runs
+                    .get_mut(run_id)
+                    .ok_or_else(|| ProjectionError::UnknownRun(run_id.clone()))?;
+                if run.status != RunStatus::Running {
+                    return Err(ProjectionError::InvalidRunTransition {
+                        run_id: run_id.clone(),
+                        from: run.status,
+                        to: RunStatus::Running,
+                    });
+                }
+                run.attempt_id = Some(attempt_id.clone());
+                run.attempts = *attempt;
+            }
+            crate::SemanticEvent::RunFailed { run_id, error } => {
+                self.set_run_terminal(run_id, RunStatus::Failed, Some(error.clone()))?;
+                self.queue_paused = true;
+            }
+            crate::SemanticEvent::RunCancelled { run_id, .. } => {
+                self.set_run_terminal(run_id, RunStatus::Cancelled, None)?;
+                self.queue_paused = true;
+            }
+            crate::SemanticEvent::RunInterrupted { run_id, reason } => {
+                self.set_run_terminal(run_id, RunStatus::Interrupted, Some(reason.clone()))?;
+                self.queue_paused = true;
+            }
+            crate::SemanticEvent::RunRequiresAction { run_id, .. } => {
+                let run = self
+                    .runs
+                    .get_mut(run_id)
+                    .ok_or_else(|| ProjectionError::UnknownRun(run_id.clone()))?;
+                if run.status != RunStatus::Running {
+                    return Err(ProjectionError::InvalidRunTransition {
+                        run_id: run_id.clone(),
+                        from: run.status,
+                        to: RunStatus::RequiresAction,
+                    });
+                }
+                run.status = RunStatus::RequiresAction;
+                self.queue_paused = true;
+            }
+            crate::SemanticEvent::RunAttemptFailed { run_id, error, .. } => {
+                let run = self
+                    .runs
+                    .get_mut(run_id)
+                    .ok_or_else(|| ProjectionError::UnknownRun(run_id.clone()))?;
+                run.error = Some(error.clone());
+            }
+            crate::SemanticEvent::QueuePaused => self.queue_paused = true,
+            crate::SemanticEvent::QueueResumed => self.queue_paused = false,
+            crate::SemanticEvent::SessionForked { .. } => self.queue_paused = true,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn set_run_terminal(
+        &mut self,
+        run_id: &str,
+        status: RunStatus,
+        error: Option<String>,
+    ) -> Result<(), ProjectionError> {
+        let run = self
+            .runs
+            .get_mut(run_id)
+            .ok_or_else(|| ProjectionError::UnknownRun(run_id.to_owned()))?;
+        if !matches!(
+            run.status,
+            RunStatus::Queued | RunStatus::Running | RunStatus::RequiresAction
+        ) {
+            return Err(ProjectionError::InvalidRunTransition {
+                run_id: run_id.to_owned(),
+                from: run.status,
+                to: status,
+            });
+        }
+        run.status = status;
+        run.error = error;
+        Ok(())
+    }
+
+    pub fn active_run(&self) -> Option<&RunProjection> {
+        self.runs
+            .values()
+            .find(|run| run.status == RunStatus::Running)
+    }
+
+    pub fn queued_runs(&self) -> impl Iterator<Item = &RunProjection> {
+        let mut runs: Vec<_> = self
+            .runs
+            .values()
+            .filter(|run| run.status == RunStatus::Queued)
+            .collect();
+        runs.sort_by(|left, right| {
+            left.queue_priority
+                .cmp(&right.queue_priority)
+                .then_with(|| left.run_id.cmp(&right.run_id))
+        });
+        runs.into_iter()
+    }
+}
+
+fn allowed_sources(next: SessionPhase) -> &'static [SessionPhase] {
+    match next {
+        SessionPhase::Created => &[],
+        SessionPhase::Running => &[
+            SessionPhase::Created,
+            SessionPhase::Finished,
+            SessionPhase::Interrupted,
+            SessionPhase::Failed,
+        ],
+        SessionPhase::Interrupted => &[SessionPhase::Running],
+        SessionPhase::Finished => &[SessionPhase::Running],
+        SessionPhase::Failed => &[
+            SessionPhase::Created,
+            SessionPhase::Running,
+            SessionPhase::Interrupted,
+        ],
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -73,26 +508,131 @@ pub struct SessionTransitionError {
     pub to: SessionPhase,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ProjectionError {
+    #[error("session creation event was duplicated")]
+    DuplicateCreation,
+    #[error("invalid transition while projecting session: {0}")]
+    InvalidTransition(#[from] SessionTransitionError),
+    #[error("message {0} was started more than once")]
+    DuplicateMessage(String),
+    #[error("message {0} is unknown")]
+    UnknownMessage(String),
+    #[error("message {0} is already closed")]
+    MessageAlreadyClosed(String),
+    #[error("agent {0} was spawned more than once")]
+    DuplicateAgent(String),
+    #[error("run {0} was queued more than once")]
+    DuplicateRun(String),
+    #[error("run {0} is unknown")]
+    UnknownRun(String),
+    #[error("invalid run {run_id} transition from {from:?} to {to:?}")]
+    InvalidRunTransition {
+        run_id: String,
+        from: RunStatus,
+        to: RunStatus,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn accepts_the_happy_path_and_increments_revision() {
-        let mut session = SessionState::new("session-1");
-        session.start().expect("new sessions can start");
-        session.finish().expect("running sessions can finish");
-
-        assert_eq!(session.phase, SessionPhase::Finished);
-        assert_eq!(session.revision, 2);
+    fn accepts_resumable_session_phases() {
+        let mut state = SessionState::new("session-1");
+        state.start().expect("created sessions can start");
+        state.finish().expect("running sessions can finish");
+        state
+            .start()
+            .expect("finished sessions can receive a new run");
+        state.fail().expect("running sessions can fail");
+        state.start().expect("failed sessions can be resumed");
+        assert_eq!(state.phase, SessionPhase::Running);
     }
 
     #[test]
-    fn rejects_transitions_from_a_terminal_phase() {
-        let mut session = SessionState::new("session-1");
-        session.fail().expect("new sessions can fail");
+    fn rejects_transitions_from_created_to_finished() {
+        let mut state = SessionState::new("session-1");
+        assert!(state.finish().is_err());
+    }
 
-        assert!(session.start().is_err());
-        assert_eq!(session.revision, 1);
+    #[test]
+    fn projects_messages_runs_and_permissions() {
+        let mut projection = SessionProjection::new("s");
+        projection
+            .apply(1, &crate::SemanticEvent::SessionCreated { title: None })
+            .expect("creation projects");
+        projection
+            .apply(
+                2,
+                &crate::SemanticEvent::RunQueued {
+                    run_id: "r".into(),
+                    retry_of: None,
+                    provider: "local".into(),
+                    model: "model".into(),
+                    request: serde_json::json!({"stream": true}),
+                },
+            )
+            .expect("run queues");
+        projection
+            .apply(
+                3,
+                &crate::SemanticEvent::MessageStarted {
+                    message_id: "m".into(),
+                    agent_id: String::new(),
+                    role: MessageRole::User,
+                    author: MessageAuthor::User,
+                },
+            )
+            .expect("message starts");
+        projection
+            .apply(
+                4,
+                &crate::SemanticEvent::MessageContentAppended {
+                    message_id: "m".into(),
+                    block: ContentBlock::Text("hello".into()),
+                },
+            )
+            .expect("content appends");
+        projection
+            .apply(
+                5,
+                &crate::SemanticEvent::MessageCompleted {
+                    message_id: "m".into(),
+                },
+            )
+            .expect("message completes");
+        assert_eq!(projection.messages[0].blocks.len(), 1);
+        assert_eq!(projection.runs["r"].status, RunStatus::Queued);
+    }
+
+    #[test]
+    fn retries_are_selected_before_existing_queued_runs() {
+        let mut projection = SessionProjection::new("s");
+        projection
+            .apply(1, &crate::SemanticEvent::SessionCreated { title: None })
+            .expect("creation projects");
+        for id in ["normal", "retry"] {
+            projection
+                .apply(
+                    if id == "normal" { 2 } else { 3 },
+                    &crate::SemanticEvent::RunQueued {
+                        run_id: id.into(),
+                        retry_of: (id == "retry").then(|| "failed".into()),
+                        provider: "provider".into(),
+                        model: "model".into(),
+                        request: serde_json::json!({}),
+                    },
+                )
+                .expect("run queues");
+        }
+        assert_eq!(
+            projection
+                .queued_runs()
+                .next()
+                .map(|run| run.run_id.as_str()),
+            Some("retry")
+        );
     }
 }
