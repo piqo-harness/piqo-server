@@ -1,0 +1,112 @@
+name: Release macOS
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Cargo package version, without the v prefix
+        required: true
+        type: string
+    outputs:
+      artifact_name:
+        description: Name of the uploaded macOS workflow artifact
+        value: ${{ jobs.package.outputs.artifact_name }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    name: Package macOS arm64
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      artifact_name: ${{ steps.metadata.outputs.artifact_name }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin
+
+      - name: Validate package version
+        id: metadata
+        env:
+          VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version=$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -er '.packages[] | select(.name == "piqo-server") | .version')
+          if [[ "$VERSION" != "$cargo_version" ]]; then
+            echo "release version $VERSION does not match Cargo version $cargo_version" >&2
+            exit 1
+          fi
+          echo "artifact_name=piqo-server-v${VERSION}-macos-arm64" >> "$GITHUB_OUTPUT"
+
+      - name: Build distributable archive
+        run: ./scripts/package-macos-arm64.sh dist
+
+      - name: Verify distributable archive
+        env:
+          ARTIFACT_NAME: ${{ steps.metadata.outputs.artifact_name }}
+          VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="dist/${ARTIFACT_NAME}.tar.gz"
+          test -f "$archive"
+
+          staging=$(mktemp -d)
+          trap 'rm -rf "$staging"' EXIT
+          tar -xzf "$archive" -C "$staging"
+          package="$staging/$ARTIFACT_NAME"
+          binary="$package/piqo-server"
+
+          test -x "$binary"
+          test -f "$package/LICENSE"
+          test -f "$package/manifest.json"
+          [[ "$(lipo -archs "$binary")" == "arm64" ]]
+          [[ "$($binary --version)" == "piqo-server $VERSION" ]]
+
+          minimum_macos=$(otool -l "$binary" \
+            | awk '/LC_BUILD_VERSION/{found=1; next} found && /minos/{print $2; exit}')
+          [[ "$minimum_macos" == "26.0" ]]
+
+          jq -e \
+            --arg version "$VERSION" \
+            '.server_version == $version
+              and .api_version == "v1"
+              and .protocol_version == 1
+              and .target == "aarch64-apple-darwin"
+              and .minimum_macos == "26.0"' \
+            "$package/manifest.json"
+
+          signing_info=$(codesign -dvv "$binary" 2>&1 || true)
+          if grep -q '^Authority=' <<< "$signing_info"; then
+            echo "release binary must not carry a distribution identity" >&2
+            exit 1
+          fi
+
+      - name: Attest archive provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/${{ steps.metadata.outputs.artifact_name }}.tar.gz
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.metadata.outputs.artifact_name }}
+          if-no-files-found: error
+          retention-days: 30
+          path: dist/${{ steps.metadata.outputs.artifact_name }}.tar.gz

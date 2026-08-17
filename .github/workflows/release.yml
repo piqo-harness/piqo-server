@@ -1,0 +1,116 @@
+name: Release
+run-name: Prepare piqo-server ${{ inputs.version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, without the v prefix
+        required: true
+        type: string
+
+concurrency:
+  group: release-v${{ inputs.version }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Validate version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out selected revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate Cargo version
+        id: version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version=$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -er '.packages[] | select(.name == "piqo-server") | .version')
+          if [[ "$REQUESTED_VERSION" != "$cargo_version" ]]; then
+            echo "requested version $REQUESTED_VERSION does not match Cargo version $cargo_version" >&2
+            exit 1
+          fi
+          echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$cargo_version" >> "$GITHUB_OUTPUT"
+
+  release_macos:
+    name: Build macOS artifact
+    needs: prepare
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/release-macos.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+
+  publish:
+    name: Create draft release
+    needs:
+      - prepare
+      - release_macos
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download macOS artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.release_macos.outputs.artifact_name }}
+          path: dist
+
+      - name: Create or update draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(dist/*)
+          if (( ${#assets[@]} == 0 )); then
+            echo "no release artifacts were downloaded" >&2
+            exit 1
+          fi
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            is_draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)
+            if [[ "$is_draft" != "true" ]]; then
+              echo "release $RELEASE_TAG already exists and is not a draft" >&2
+              exit 1
+            fi
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          else
+            prerelease=()
+            if [[ "$VERSION" == *-* ]]; then
+              prerelease+=(--prerelease)
+            fi
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --draft \
+              --target "$GITHUB_SHA" \
+              --generate-notes \
+              --title "piqo-server $VERSION" \
+              --notes "Embeddable sidecar artifacts. The macOS executable must be signed by the host application before distribution." \
+              "${prerelease[@]}"
+          fi
+
+          release_url=$(gh release view "$RELEASE_TAG" --json url --jq .url)
+          printf '### Draft release\n\n[%s](%s)\n' "$RELEASE_TAG" "$release_url" \
+            >> "$GITHUB_STEP_SUMMARY"

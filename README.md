@@ -219,9 +219,20 @@ Build the macOS arm64 distribution archive locally with:
 ./scripts/package-macos-arm64.sh
 ```
 
-The script produces `dist/piqo-server-v<version>-macos-arm64.tar.gz` and a
-matching SHA-256 file. Tagged releases run the same packaging flow in GitHub
-Actions. The package targets macOS 26.0 or newer and is intentionally unsigned.
+The script produces `dist/piqo-server-v<version>-macos-arm64.tar.gz`. The
+archive contains the executable, its MIT license, and a machine-readable
+compatibility manifest. GitHub records the SHA-256 digest when the artifact is
+uploaded, so the repository does not publish a redundant checksum file.
+
+To prepare a release, manually run the `Release` workflow and enter the Cargo
+package version without a `v` prefix. The orchestrator validates the version,
+calls the platform packaging workflows, downloads their artifacts, and creates
+a draft in [GitHub Releases](https://github.com/piqo-harness/piqo-server/releases).
+The macOS arm64 package is currently the only release artifact.
+
+The package targets macOS 26.0 or newer and carries no distribution identity.
+The host application must replace any linker-generated ad hoc signature with
+its own signature before distribution.
 
 ## Configuration
 
