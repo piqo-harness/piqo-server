@@ -156,6 +156,13 @@ pub struct ProviderModelsResponse {
     pub discovery: ModelDiscovery,
 }
 
+#[derive(Debug, Clone)]
+pub struct ConfigSnapshot {
+    pub revision: u64,
+    pub loaded_at: String,
+    pub config: Arc<PiqoConfig>,
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to read configuration {path}: {source}")]
@@ -195,6 +202,8 @@ pub enum ConfigError {
     LockPoisoned,
     #[error("configuration task failed: {0}")]
     Task(String),
+    #[error("configuration revision is exhausted")]
+    RevisionExhausted,
 }
 
 #[derive(Debug, Clone)]
@@ -205,7 +214,7 @@ struct DiscoveryCache {
 
 struct ConfigManagerInner {
     path: Option<PathBuf>,
-    config: RwLock<Arc<PiqoConfig>>,
+    config: RwLock<ConfigSnapshot>,
     mutation: Mutex<()>,
     discovery: RwLock<HashMap<String, DiscoveryCache>>,
     transport: ProviderTransport,
@@ -378,11 +387,19 @@ impl ConfigManager {
         Self::new(None, config)
     }
 
+    pub fn file(path: impl Into<PathBuf>, config: PiqoConfig) -> Self {
+        Self::new(Some(path.into()), config)
+    }
+
     fn new(path: Option<PathBuf>, config: PiqoConfig) -> Self {
         Self {
             inner: Arc::new(ConfigManagerInner {
                 path,
-                config: RwLock::new(Arc::new(config)),
+                config: RwLock::new(ConfigSnapshot {
+                    revision: 1,
+                    loaded_at: now(),
+                    config: Arc::new(config),
+                }),
                 mutation: Mutex::new(()),
                 discovery: RwLock::new(HashMap::new()),
                 transport: ProviderTransport::new(),
@@ -394,8 +411,55 @@ impl ConfigManager {
         self.inner
             .config
             .read()
-            .map(|config| config.clone())
+            .map(|snapshot| snapshot.config.clone())
             .map_err(|_| ConfigError::LockPoisoned)
+    }
+
+    pub fn versioned_snapshot(&self) -> Result<ConfigSnapshot, ConfigError> {
+        self.inner
+            .config
+            .read()
+            .map(|snapshot| snapshot.clone())
+            .map_err(|_| ConfigError::LockPoisoned)
+    }
+
+    pub async fn reload(&self) -> Result<ConfigSnapshot, ConfigError> {
+        let path = self.inner.path.clone().ok_or(ConfigError::ReadOnly)?;
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = inner
+                .mutation
+                .lock()
+                .map_err(|_| ConfigError::LockPoisoned)?;
+            let text = fs::read_to_string(&path).map_err(|source| ConfigError::Read {
+                path: path.display().to_string(),
+                source,
+            })?;
+            let config: PiqoConfig = toml::from_str(&text)?;
+            config.validate()?;
+            let mut current = inner
+                .config
+                .write()
+                .map_err(|_| ConfigError::LockPoisoned)?;
+            let snapshot = ConfigSnapshot {
+                revision: current
+                    .revision
+                    .checked_add(1)
+                    .ok_or(ConfigError::RevisionExhausted)?,
+                loaded_at: now(),
+                config: Arc::new(config),
+            };
+            *current = snapshot.clone();
+            drop(current);
+            inner
+                .discovery
+                .write()
+                .map_err(|_| ConfigError::LockPoisoned)?
+                .clear();
+            Ok(snapshot)
+        })
+        .await
+        .map_err(|error| ConfigError::Task(error.to_string()))?
     }
 
     pub fn resolve_provider(&self, name: &str) -> Result<ResolvedProvider, ConfigError> {
@@ -760,10 +824,18 @@ impl ConfigManager {
             let config: PiqoConfig = toml::from_str(&text)?;
             config.validate()?;
             write_atomic(&path, text.as_bytes())?;
-            *inner
+            let mut current = inner
                 .config
                 .write()
-                .map_err(|_| ConfigError::LockPoisoned)? = Arc::new(config);
+                .map_err(|_| ConfigError::LockPoisoned)?;
+            *current = ConfigSnapshot {
+                revision: current
+                    .revision
+                    .checked_add(1)
+                    .ok_or(ConfigError::RevisionExhausted)?,
+                loaded_at: now(),
+                config: Arc::new(config),
+            };
             Ok(())
         })
         .await
@@ -1104,6 +1176,56 @@ models = []
         assert_eq!(snapshot.providers["two"].connect_timeout_seconds, 22);
         let text = fs::read_to_string(path).expect("configuration reads");
         assert!(text.contains("# keep concurrent edits"));
+    }
+
+    #[tokio::test]
+    async fn reload_replaces_the_snapshot_atomically_and_increments_revision() {
+        let directory = tempdir().expect("temporary directory creates");
+        let path = directory.path().join("piqo.toml");
+        fs::write(
+            &path,
+            "[providers.first]\nbase_url = \"http://127.0.0.1:8000\"\nmodels = []\n",
+        )
+        .expect("initial configuration writes");
+        let manager = ConfigManager::load(&path).expect("manager loads");
+        let before = manager.versioned_snapshot().expect("snapshot reads");
+
+        fs::write(
+            &path,
+            "[providers.second]\nbase_url = \"https://example.com\"\nmodels = []\n",
+        )
+        .expect("replacement configuration writes");
+        let after = manager.reload().await.expect("configuration reloads");
+
+        assert_eq!(before.revision, 1);
+        assert_eq!(after.revision, 2);
+        assert!(before.config.providers.contains_key("first"));
+        assert!(after.config.providers.contains_key("second"));
+        assert_eq!(
+            manager
+                .versioned_snapshot()
+                .expect("snapshot reads")
+                .revision,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_rejects_invalid_configuration_without_replacing_the_snapshot() {
+        let directory = tempdir().expect("temporary directory creates");
+        let path = directory.path().join("piqo.toml");
+        fs::write(&path, "").expect("initial configuration writes");
+        let manager = ConfigManager::load(&path).expect("manager loads");
+        fs::write(&path, "invalid = [").expect("invalid configuration writes");
+
+        assert!(manager.reload().await.is_err());
+        assert_eq!(
+            manager
+                .versioned_snapshot()
+                .expect("snapshot reads")
+                .revision,
+            1
+        );
     }
 
     #[test]

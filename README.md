@@ -309,6 +309,18 @@ names. Prefer the `environment` credential form over storing a literal key:
 The global `[models."model-id".body]` tables below remain request-body layers;
 they are separate from each provider's optional model catalog.
 
+Reload the complete file without restarting the process:
+
+```sh
+curl -X POST http://127.0.0.1:8080/api/v1/config/reload
+```
+
+The replacement is atomic. Active runs keep the configuration captured when
+they started, while queued runs use the latest configuration when execution
+begins. An invalid or missing file returns `422/config_invalid`, then causes a
+graceful shutdown with a non-zero process exit so the host can surface the
+configuration error.
+
 ### Request-body layers
 
 Request bodies are shallow-merged in this order, with later layers winning:
@@ -443,6 +455,7 @@ curl -N \
 | `GET`, `PATCH`, `DELETE` | `/api/v1/providers/{provider}` | Inspect, update, or immediately delete a provider |
 | `GET`, `PUT`, `DELETE` | `/api/v1/providers/{provider}/models` | Read, replace, or clear the manual model catalog |
 | `POST` | `/api/v1/providers/{provider}/models/refresh` | Refresh automatic discovery when no manual override exists |
+| `POST` | `/api/v1/config/reload` | Atomically reload `piqo.toml` |
 | `POST` | `/api/v1/sessions/{id}/runs` | Queue a run |
 | `GET` | `/api/v1/sessions/{id}/runs/{run_id}` | Inspect a run |
 | `POST` | `/api/v1/sessions/{id}/runs/{run_id}/cancel` | Cancel a run |

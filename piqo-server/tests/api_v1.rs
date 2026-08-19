@@ -211,6 +211,7 @@ async fn openapi_documents_run_and_queue_routes() {
         ("/api/v1/providers/{provider}/models", "put"),
         ("/api/v1/providers/{provider}/models", "delete"),
         ("/api/v1/providers/{provider}/models/refresh", "post"),
+        ("/api/v1/config/reload", "post"),
         ("/api/v1/sessions/{session_id}/runs", "post"),
         ("/api/v1/sessions/{session_id}/runs/{run_id}", "get"),
         ("/api/v1/sessions/{session_id}/runs/{run_id}/cancel", "post"),
@@ -232,6 +233,56 @@ async fn openapi_documents_run_and_queue_routes() {
         value["components"]["schemas"]["ProviderCredentialInput"]["oneOf"][1]["properties"]
             ["value"]["writeOnly"],
         true
+    );
+}
+
+#[tokio::test]
+async fn reloads_configuration_and_updates_the_provider_catalog() {
+    let (app, _database, config_directory) = configurable_app().await;
+    let config_path = config_directory.path().join("piqo.toml");
+    std::fs::write(
+        &config_path,
+        r#"[providers.second]
+base_url = "https://example.com"
+models = ["vendor/model"]
+
+[models."vendor/model".body]
+temperature = 0.5
+"#,
+    )
+    .expect("replacement configuration writes");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/config/reload")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("request succeeds");
+    assert_eq!(response.status(), StatusCode::OK);
+    let reloaded = json_body(response).await;
+    assert_eq!(reloaded["revision"], 2);
+    assert!(reloaded["loaded_at"].as_str().is_some());
+    assert_eq!(reloaded["providers"][0]["name"], "second");
+    assert_eq!(reloaded["providers"][0]["models"][0], "vendor/model");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/providers")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("request succeeds");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(response).await["providers"],
+        reloaded["providers"]
     );
 }
 
