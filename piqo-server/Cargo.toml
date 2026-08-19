@@ -18,9 +18,11 @@ getrandom.workspace = true
 piqo-core = { path = "../piqo-core" }
 piqo-provider = { path = "../piqo-provider" }
 piqo-tools = { path = "../piqo-tools" }
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
+toml_edit.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -36,5 +38,4 @@ uuid.workspace = true
 [dev-dependencies]
 http-body-util = "0.1"
 libc = "0.2"
-reqwest.workspace = true
 tempfile = "3"

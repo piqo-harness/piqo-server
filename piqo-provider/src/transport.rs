@@ -57,6 +57,12 @@ pub enum ProviderTransportError {
     InvalidJson(#[from] serde_json::Error),
     #[error("provider SSE event is malformed: {0}")]
     MalformedSse(String),
+    #[error("provider request contains an invalid header: {0}")]
+    InvalidHeader(String),
+    #[error("provider returned HTTP status {0}")]
+    HttpStatus(reqwest::StatusCode),
+    #[error("provider model catalog is malformed")]
+    MalformedModelCatalog,
 }
 
 #[derive(Clone, Debug)]
@@ -98,9 +104,9 @@ impl ProviderTransport {
         let mut request = self.client.post(endpoint).json(&body).build()?;
         for (name, value) in headers {
             let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
-                .map_err(|_| ProviderTransportError::MalformedSse("invalid header name".into()))?;
+                .map_err(|_| ProviderTransportError::InvalidHeader("invalid name".into()))?;
             let value = reqwest::header::HeaderValue::from_str(value)
-                .map_err(|_| ProviderTransportError::MalformedSse("invalid header value".into()))?;
+                .map_err(|_| ProviderTransportError::InvalidHeader("invalid value".into()))?;
             request.headers_mut().insert(name, value);
         }
         Ok(request)
@@ -126,6 +132,55 @@ impl ProviderTransport {
             .build()?;
         client.execute(request).await
     }
+
+    /// Query an OpenAI-compatible model catalog without retaining response
+    /// bodies in errors, since upstream errors may contain sensitive data.
+    pub async fn discover_models(
+        &self,
+        endpoint: &str,
+        headers: &HashMap<String, String>,
+        connect_timeout: Duration,
+    ) -> Result<Vec<String>, ProviderTransportError> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(connect_timeout)
+            .timeout(connect_timeout)
+            .build()?;
+        let mut request = client.get(endpoint).build()?;
+        for (name, value) in headers {
+            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| ProviderTransportError::InvalidHeader("invalid name".into()))?;
+            let value = reqwest::header::HeaderValue::from_str(value)
+                .map_err(|_| ProviderTransportError::InvalidHeader("invalid value".into()))?;
+            request.headers_mut().insert(name, value);
+        }
+        let response = client.execute(request).await?;
+        if !response.status().is_success() {
+            return Err(ProviderTransportError::HttpStatus(response.status()));
+        }
+        let value: Value = response.json().await?;
+        parse_model_catalog(&value)
+    }
+}
+
+fn parse_model_catalog(value: &Value) -> Result<Vec<String>, ProviderTransportError> {
+    let data = value
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or(ProviderTransportError::MalformedModelCatalog)?;
+    let mut models = data
+        .iter()
+        .map(|model| {
+            model
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or(ProviderTransportError::MalformedModelCatalog)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    models.sort();
+    models.dedup();
+    Ok(models)
 }
 
 pub fn parse_sse_event(
@@ -382,6 +437,23 @@ mod tests {
         assert!(matches!(
             deltas.first(),
             Some(ProviderDelta::ToolCallDelta { .. })
+        ));
+    }
+
+    #[test]
+    fn parses_and_deduplicates_model_catalogs() {
+        let models = parse_model_catalog(&serde_json::json!({
+            "data": [{"id": "zeta"}, {"id": "alpha"}, {"id": "zeta"}]
+        }))
+        .expect("catalog parses");
+        assert_eq!(models, vec!["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn rejects_malformed_model_catalogs() {
+        assert!(matches!(
+            parse_model_catalog(&serde_json::json!({"data": [{"name": "missing-id"}]})),
+            Err(ProviderTransportError::MalformedModelCatalog)
         ));
     }
 }

@@ -44,7 +44,12 @@ use tower_http::trace::TraceLayer;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi, ToSchema};
 
-pub use config::{ConfigError, PiqoConfig, ProviderCatalogEntry, ProviderConfig};
+pub use config::{
+    ConfigError, ConfigManager, CreateProviderRequest, DiscoveryStatus, ModelDiscovery,
+    ModelSource, PiqoConfig, ProviderCatalogEntry, ProviderConfig, ProviderCredentialInput,
+    ProviderCredentialSummary, ProviderModelsResponse, ReplaceProviderModelsRequest,
+    UpdateProviderRequest,
+};
 pub use runtime::{
     ensure_private_directory, prepare_server, PreparedServer, ServerError, ServerOptions,
 };
@@ -72,7 +77,7 @@ pub struct AppState {
     store: SqliteStore,
     hub: EventHub,
     supervisor: SessionSupervisor,
-    config: Arc<PiqoConfig>,
+    config: ConfigManager,
     lifecycle: Arc<LifecycleState>,
 }
 
@@ -102,12 +107,35 @@ impl AppState {
     }
 
     pub fn with_config(store: SqliteStore, config: Arc<PiqoConfig>) -> Self {
-        Self::with_config_and_dump(store, config, None)
+        Self::with_config_manager_and_dump(store, ConfigManager::memory((*config).clone()), None)
+    }
+
+    pub fn with_config_file(
+        store: SqliteStore,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, ConfigError> {
+        Ok(Self::with_config_manager_and_dump(
+            store,
+            ConfigManager::load(path)?,
+            None,
+        ))
     }
 
     pub fn with_config_and_dump(
         store: SqliteStore,
         config: Arc<PiqoConfig>,
+        dump_dir: Option<std::path::PathBuf>,
+    ) -> Self {
+        Self::with_config_manager_and_dump(
+            store,
+            ConfigManager::memory((*config).clone()),
+            dump_dir,
+        )
+    }
+
+    fn with_config_manager_and_dump(
+        store: SqliteStore,
+        config: ConfigManager,
         dump_dir: Option<std::path::PathBuf>,
     ) -> Self {
         let hub = EventHub::new();
@@ -124,7 +152,7 @@ impl AppState {
 
     pub(crate) fn with_config_and_dump_and_shutdown(
         store: SqliteStore,
-        config: Arc<PiqoConfig>,
+        config: ConfigManager,
         dump_dir: Option<std::path::PathBuf>,
         shutdown: CancellationToken,
     ) -> Self {
@@ -153,7 +181,7 @@ impl AppState {
         &self.supervisor
     }
 
-    pub fn config(&self) -> &PiqoConfig {
+    pub fn config(&self) -> &ConfigManager {
         &self.config
     }
 
@@ -398,6 +426,7 @@ struct EventsQuery {
 #[derive(Debug)]
 pub enum ApiError {
     Store(StoreError),
+    Config(ConfigError),
     BadRequest { code: &'static str, message: String },
 }
 
@@ -472,10 +501,54 @@ impl From<StoreError> for ApiError {
     }
 }
 
+impl From<ConfigError> for ApiError {
+    fn from(error: ConfigError) -> Self {
+        Self::Config(error)
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let (status, code, message) = match self {
             Self::BadRequest { code, message } => (StatusCode::BAD_REQUEST, code, message),
+            Self::Config(ConfigError::ProviderNotFound(name)) => (
+                StatusCode::NOT_FOUND,
+                "provider_not_found",
+                format!("provider {name} was not found"),
+            ),
+            Self::Config(ConfigError::ProviderAlreadyExists(name)) => (
+                StatusCode::CONFLICT,
+                "provider_already_exists",
+                format!("provider {name} already exists"),
+            ),
+            Self::Config(ConfigError::ManualModelOverride(name)) => (
+                StatusCode::CONFLICT,
+                "manual_model_override",
+                format!("provider {name} has a manual model override"),
+            ),
+            Self::Config(ConfigError::InvalidProvider(message)) => {
+                (StatusCode::BAD_REQUEST, "invalid_request", message)
+            }
+            Self::Config(ConfigError::InvalidProtocol { source, .. }) => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                source.to_string(),
+            ),
+            Self::Config(ConfigError::ConflictingCredentials(name)) => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                format!("provider {name} has conflicting credentials"),
+            ),
+            Self::Config(ConfigError::ReadOnly) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "configuration_read_only",
+                "provider configuration is read-only".to_owned(),
+            ),
+            Self::Config(_error) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "configuration_unavailable",
+                "provider configuration is temporarily unavailable".to_owned(),
+            ),
             Self::Store(StoreError::SessionNotFound(id)) => (
                 StatusCode::NOT_FOUND,
                 "session_not_found",
@@ -606,7 +679,26 @@ pub fn router_with_token(state: AppState, token: Option<String>) -> Router {
             get(stream_events),
         )
         .route("/api/v1/sessions/{session_id}/forks", post(fork_session))
-        .route("/api/v1/providers", get(list_providers))
+        .route(
+            "/api/v1/providers",
+            get(list_providers).post(create_provider),
+        )
+        .route(
+            "/api/v1/providers/{provider}",
+            get(get_provider)
+                .patch(update_provider)
+                .delete(delete_provider),
+        )
+        .route(
+            "/api/v1/providers/{provider}/models",
+            get(list_provider_models)
+                .put(replace_provider_models)
+                .delete(clear_provider_models),
+        )
+        .route(
+            "/api/v1/providers/{provider}/models/refresh",
+            post(refresh_provider_models),
+        )
         .route("/api/v1/sessions/{session_id}/runs", post(create_run))
         .route("/api/v1/sessions/{session_id}/runs/{run_id}", get(get_run))
         .route(
@@ -1082,12 +1174,140 @@ async fn fork_session(
 #[utoipa::path(
     get,
     path = "/api/v1/providers",
-    responses((status = 200, body = ProviderCatalogResponse))
+    tag = "providers",
+    responses((status = 200, body = ProviderCatalogResponse), (status = 503, body = ErrorResponse))
 )]
-async fn list_providers(State(state): State<AppState>) -> Json<ProviderCatalogResponse> {
-    Json(ProviderCatalogResponse {
-        providers: state.config().catalog(),
-    })
+async fn list_providers(
+    State(state): State<AppState>,
+) -> Result<Json<ProviderCatalogResponse>, ApiError> {
+    Ok(Json(ProviderCatalogResponse {
+        providers: state.config().catalog()?,
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/providers",
+    tag = "providers",
+    request_body = CreateProviderRequest,
+    responses((status = 201, body = ProviderCatalogEntry), (status = 400, body = ErrorResponse), (status = 409, body = ErrorResponse), (status = 503, body = ErrorResponse))
+)]
+async fn create_provider(
+    State(state): State<AppState>,
+    ApiJson(request): ApiJson<CreateProviderRequest>,
+) -> Result<(StatusCode, Json<ProviderCatalogEntry>), ApiError> {
+    let provider = state.config().create_provider(request).await?;
+    Ok((StatusCode::CREATED, Json(provider)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/providers/{provider}",
+    tag = "providers",
+    params(("provider" = String, Path)),
+    responses((status = 200, body = ProviderCatalogEntry), (status = 404, body = ErrorResponse), (status = 503, body = ErrorResponse))
+)]
+async fn get_provider(
+    State(state): State<AppState>,
+    ApiPath(provider): ApiPath<String>,
+) -> Result<Json<ProviderCatalogEntry>, ApiError> {
+    Ok(Json(state.config().provider(&provider)?))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/providers/{provider}",
+    tag = "providers",
+    params(("provider" = String, Path)),
+    request_body = UpdateProviderRequest,
+    responses((status = 200, body = ProviderCatalogEntry), (status = 400, body = ErrorResponse), (status = 404, body = ErrorResponse), (status = 503, body = ErrorResponse))
+)]
+async fn update_provider(
+    State(state): State<AppState>,
+    ApiPath(provider): ApiPath<String>,
+    ApiJson(request): ApiJson<UpdateProviderRequest>,
+) -> Result<Json<ProviderCatalogEntry>, ApiError> {
+    Ok(Json(
+        state.config().update_provider(&provider, request).await?,
+    ))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/v1/providers/{provider}",
+    tag = "providers",
+    params(("provider" = String, Path)),
+    responses((status = 204), (status = 404, body = ErrorResponse), (status = 503, body = ErrorResponse))
+)]
+async fn delete_provider(
+    State(state): State<AppState>,
+    ApiPath(provider): ApiPath<String>,
+) -> Result<StatusCode, ApiError> {
+    state.config().delete_provider(&provider).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/providers/{provider}/models",
+    tag = "models",
+    params(("provider" = String, Path)),
+    responses((status = 200, body = ProviderModelsResponse), (status = 404, body = ErrorResponse), (status = 503, body = ErrorResponse))
+)]
+async fn list_provider_models(
+    State(state): State<AppState>,
+    ApiPath(provider): ApiPath<String>,
+) -> Result<Json<ProviderModelsResponse>, ApiError> {
+    Ok(Json(state.config().models(&provider)?))
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/v1/providers/{provider}/models",
+    tag = "models",
+    params(("provider" = String, Path)),
+    request_body = ReplaceProviderModelsRequest,
+    responses((status = 200, body = ProviderModelsResponse), (status = 400, body = ErrorResponse), (status = 404, body = ErrorResponse), (status = 503, body = ErrorResponse))
+)]
+async fn replace_provider_models(
+    State(state): State<AppState>,
+    ApiPath(provider): ApiPath<String>,
+    ApiJson(request): ApiJson<ReplaceProviderModelsRequest>,
+) -> Result<Json<ProviderModelsResponse>, ApiError> {
+    Ok(Json(
+        state
+            .config()
+            .replace_models(&provider, request.models)
+            .await?,
+    ))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/v1/providers/{provider}/models",
+    tag = "models",
+    params(("provider" = String, Path)),
+    responses((status = 200, body = ProviderModelsResponse), (status = 404, body = ErrorResponse), (status = 503, body = ErrorResponse))
+)]
+async fn clear_provider_models(
+    State(state): State<AppState>,
+    ApiPath(provider): ApiPath<String>,
+) -> Result<Json<ProviderModelsResponse>, ApiError> {
+    Ok(Json(state.config().clear_models(&provider).await?))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/providers/{provider}/models/refresh",
+    tag = "models",
+    params(("provider" = String, Path)),
+    responses((status = 200, body = ProviderModelsResponse), (status = 404, body = ErrorResponse), (status = 409, body = ErrorResponse), (status = 503, body = ErrorResponse))
+)]
+async fn refresh_provider_models(
+    State(state): State<AppState>,
+    ApiPath(provider): ApiPath<String>,
+) -> Result<Json<ProviderModelsResponse>, ApiError> {
+    Ok(Json(state.config().refresh_models(&provider).await?))
 }
 
 #[utoipa::path(
@@ -1257,6 +1477,7 @@ fn event_for_sse(event: RecordedEvent) -> Event {
     modifiers(&SecurityAddon),
     security(("bearerAuth" = [])),
     paths(
+        openapi,
         health,
         create_project,
         list_projects,
@@ -1271,6 +1492,14 @@ fn event_for_sse(event: RecordedEvent) -> Event {
         stream_events,
         fork_session,
         list_providers,
+        create_provider,
+        get_provider,
+        update_provider,
+        delete_provider,
+        list_provider_models,
+        replace_provider_models,
+        clear_provider_models,
+        refresh_provider_models,
         create_run,
         get_run,
         cancel_run,
@@ -1294,11 +1523,23 @@ fn event_for_sse(event: RecordedEvent) -> Event {
         RunAcceptedResponse,
         RunResponse,
         ApiRun,
-        ProviderCatalogResponse
+        ProviderCatalogResponse,
+        ProviderCatalogEntry,
+        CreateProviderRequest,
+        UpdateProviderRequest,
+        ReplaceProviderModelsRequest,
+        ProviderModelsResponse,
+        ProviderCredentialInput,
+        ProviderCredentialSummary,
+        ModelSource,
+        ModelDiscovery,
+        DiscoveryStatus
     )),
     tags(
         (name = "projects", description = "Persistent project grouping API"),
-        (name = "sessions", description = "Durable session and event-log API")
+        (name = "sessions", description = "Durable session and event-log API"),
+        (name = "providers", description = "Provider configuration API"),
+        (name = "models", description = "Provider model catalog API")
     )
 )]
 pub struct ApiDoc;
@@ -1321,6 +1562,11 @@ impl Modify for SecurityAddon {
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/openapi.json",
+    responses((status = 200, description = "OpenAPI 3 document"))
+)]
 async fn openapi() -> Json<utoipa::openapi::OpenApi> {
     Json(ApiDoc::openapi())
 }

@@ -18,7 +18,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::{config::PiqoConfig, storage::StoreError, SqliteStore};
+use crate::{config::ConfigManager, storage::StoreError, SqliteStore};
 
 #[derive(Clone)]
 pub(crate) struct EventHub {
@@ -85,7 +85,7 @@ pub struct RunRequest {
 #[derive(Clone)]
 pub struct SessionSupervisor {
     store: SqliteStore,
-    config: Arc<PiqoConfig>,
+    config: ConfigManager,
     transport: ProviderTransport,
     hub: EventHub,
     locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
@@ -99,7 +99,7 @@ pub struct SessionSupervisor {
 impl SessionSupervisor {
     pub(crate) fn with_dump_dir(
         store: SqliteStore,
-        config: Arc<PiqoConfig>,
+        config: ConfigManager,
         hub: EventHub,
         dump_dir: Option<PathBuf>,
     ) -> Self {
@@ -108,7 +108,7 @@ impl SessionSupervisor {
 
     pub(crate) fn with_dump_dir_and_shutdown(
         store: SqliteStore,
-        config: Arc<PiqoConfig>,
+        config: ConfigManager,
         hub: EventHub,
         dump_dir: Option<PathBuf>,
         shutdown: CancellationToken,
@@ -1267,18 +1267,21 @@ enum DeltaResult {
 }
 
 fn build_body(
-    config: &PiqoConfig,
+    config: &ConfigManager,
     protocol: &ProviderProtocol,
     request: &RunRequest,
     projection: &piqo_core::SessionProjection,
 ) -> Result<Value, StoreError> {
-    let mut body = merge_request_bodies(config.body_layers(
-        &request.model,
-        request.agent.as_deref(),
-        request.variant.as_deref(),
-        request.body.clone(),
-    ))
-    .map_err(|error| StoreError::InvalidRequest(error.to_string()))?;
+    let layers = config
+        .body_layers(
+            &request.model,
+            request.agent.as_deref(),
+            request.variant.as_deref(),
+            request.body.clone(),
+        )
+        .map_err(|error| StoreError::ProviderUnavailable(error.to_string()))?;
+    let mut body = merge_request_bodies(layers)
+        .map_err(|error| StoreError::InvalidRequest(error.to_string()))?;
     let object = body
         .as_object_mut()
         .ok_or_else(|| StoreError::InvalidRequest("request body must be an object".into()))?;
@@ -1365,6 +1368,7 @@ fn find_sse_frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PiqoConfig;
     use serde_json::json;
     use tempfile::NamedTempFile;
     use tokio::net::TcpListener;
@@ -1390,7 +1394,7 @@ mod tests {
         let hub = EventHub::new();
         let supervisor = SessionSupervisor::with_dump_dir_and_shutdown(
             store.clone(),
-            Arc::new(config),
+            ConfigManager::memory(config),
             hub,
             None,
             CancellationToken::new(),
@@ -1502,7 +1506,7 @@ mod tests {
             .expect("events append");
         let supervisor = SessionSupervisor::with_dump_dir(
             store.clone(),
-            Arc::new(PiqoConfig::default()),
+            ConfigManager::memory(PiqoConfig::default()),
             EventHub::new(),
             None,
         );
@@ -1556,7 +1560,7 @@ mod tests {
         let mut stream = hub.subscribe(&session.id).await;
         let supervisor = SessionSupervisor::with_dump_dir_and_shutdown(
             store.clone(),
-            Arc::new(config),
+            ConfigManager::memory(config),
             hub,
             None,
             CancellationToken::new(),
