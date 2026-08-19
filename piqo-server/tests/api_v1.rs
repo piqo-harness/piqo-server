@@ -1,7 +1,8 @@
 use axum::{body::Body, http::Request};
 use http_body_util::BodyExt;
-use piqo_server::{router, AppState, SqliteStore};
+use piqo_server::{router, AppState, PiqoConfig, SqliteStore};
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tempfile::{tempdir, NamedTempFile};
 use tower::ServiceExt;
 
@@ -113,6 +114,66 @@ async fn openapi_documents_run_and_queue_routes() {
     assert!(value["components"]["schemas"]["ApiRun"].is_object());
     assert!(value["paths"]["/api/v1/projects"].is_object());
     assert!(value["paths"]["/api/v1/projects/{project_id}/sessions"].is_object());
+    assert!(value["paths"]["/api/v1/config/reload"].is_object());
+}
+
+#[tokio::test]
+async fn reloads_configuration_and_updates_the_provider_catalog() {
+    let database = NamedTempFile::new().expect("temporary sqlite file");
+    let store = SqliteStore::connect_file(database.path())
+        .await
+        .expect("store opens");
+    let directory = tempdir().expect("config directory creates");
+    let config_path = directory.path().join("piqo.toml");
+    let initial: PiqoConfig = toml::from_str(
+        r#"[providers.first]
+        base_url = "http://127.0.0.1:8000"
+        "#,
+    )
+    .expect("initial config parses");
+    let state =
+        AppState::with_config_path_and_dump(store, Arc::new(initial), config_path.clone(), None);
+    let app = router(state);
+    std::fs::write(
+        &config_path,
+        r#"[providers.second]
+        base_url = "https://example.com"
+        [models."vendor/model".body]
+        temperature = 0.5
+        "#,
+    )
+    .expect("replacement config writes");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/config/reload")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("request succeeds");
+    assert_eq!(response.status(), 200);
+    let reloaded = json_body(response).await;
+    assert_eq!(reloaded["revision"], 2);
+    assert!(reloaded["loaded_at"].as_str().is_some());
+    assert_eq!(reloaded["providers"][0]["name"], "second");
+    assert_eq!(reloaded["providers"][0]["models"][0], "vendor/model");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/providers")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("request succeeds");
+    assert_eq!(response.status(), 200);
+    let catalog = json_body(response).await;
+    assert_eq!(catalog["providers"], reloaded["providers"]);
 }
 
 #[tokio::test]

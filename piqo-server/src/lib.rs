@@ -38,13 +38,15 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex};
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi, ToSchema};
 
-pub use config::{ConfigError, PiqoConfig, ProviderCatalogEntry, ProviderConfig};
+pub use config::{
+    ConfigError, ConfigManager, ConfigSnapshot, PiqoConfig, ProviderCatalogEntry, ProviderConfig,
+};
 pub use runtime::{
     ensure_private_directory, prepare_server, PreparedServer, ServerError, ServerOptions,
 };
@@ -72,8 +74,10 @@ pub struct AppState {
     store: SqliteStore,
     hub: EventHub,
     supervisor: SessionSupervisor,
-    config: Arc<PiqoConfig>,
+    config: ConfigManager,
     lifecycle: Arc<LifecycleState>,
+    shutdown: CancellationToken,
+    fatal_reload_error: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Debug, Default)]
@@ -110,31 +114,37 @@ impl AppState {
         config: Arc<PiqoConfig>,
         dump_dir: Option<std::path::PathBuf>,
     ) -> Self {
-        let hub = EventHub::new();
-        let supervisor =
-            SessionSupervisor::with_dump_dir(store.clone(), config.clone(), hub.clone(), dump_dir);
-        Self {
-            store,
-            hub,
-            supervisor,
-            config,
-            lifecycle: Arc::new(LifecycleState::default()),
-        }
+        Self::with_config_path_and_dump(store, config, PathBuf::from("piqo.toml"), dump_dir)
     }
 
-    pub(crate) fn with_config_and_dump_and_shutdown(
+    pub fn with_config_path_and_dump(
         store: SqliteStore,
         config: Arc<PiqoConfig>,
+        config_path: PathBuf,
+        dump_dir: Option<std::path::PathBuf>,
+    ) -> Self {
+        let shutdown = CancellationToken::new();
+        Self::with_config_manager_and_shutdown(
+            store,
+            ConfigManager::new(config_path, config),
+            dump_dir,
+            shutdown,
+        )
+    }
+
+    fn with_config_manager_and_shutdown(
+        store: SqliteStore,
+        config: ConfigManager,
         dump_dir: Option<std::path::PathBuf>,
         shutdown: CancellationToken,
     ) -> Self {
         let hub = EventHub::new();
-        let supervisor = SessionSupervisor::with_dump_dir_and_shutdown(
+        let supervisor = SessionSupervisor::with_config_manager_and_shutdown(
             store.clone(),
             config.clone(),
             hub.clone(),
             dump_dir,
-            shutdown,
+            shutdown.clone(),
         );
         Self {
             store,
@@ -142,7 +152,18 @@ impl AppState {
             supervisor,
             config,
             lifecycle: Arc::new(LifecycleState::default()),
+            shutdown,
+            fatal_reload_error: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub(crate) fn with_config_manager_and_dump_and_shutdown(
+        store: SqliteStore,
+        config: ConfigManager,
+        dump_dir: Option<std::path::PathBuf>,
+        shutdown: CancellationToken,
+    ) -> Self {
+        Self::with_config_manager_and_shutdown(store, config, dump_dir, shutdown)
     }
 
     pub fn store(&self) -> &SqliteStore {
@@ -153,8 +174,25 @@ impl AppState {
         &self.supervisor
     }
 
-    pub fn config(&self) -> &PiqoConfig {
-        &self.config
+    pub async fn config_snapshot(&self) -> ConfigSnapshot {
+        self.config.snapshot().await
+    }
+
+    async fn reload_config(&self) -> Result<ConfigSnapshot, ConfigError> {
+        self.config.reload().await
+    }
+
+    async fn request_fatal_reload_shutdown(&self, message: String) {
+        let mut fatal_error = self.fatal_reload_error.lock().await;
+        if fatal_error.is_none() {
+            *fatal_error = Some(message);
+        }
+        drop(fatal_error);
+        self.shutdown.cancel();
+    }
+
+    pub(crate) async fn take_fatal_reload_error(&self) -> Option<String> {
+        self.fatal_reload_error.lock().await.take()
     }
 
     #[cfg(test)]
@@ -327,6 +365,13 @@ pub struct ProviderCatalogResponse {
     pub providers: Vec<ProviderCatalogEntry>,
 }
 
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct ConfigReloadResponse {
+    pub revision: u64,
+    pub loaded_at: String,
+    pub providers: Vec<ProviderCatalogEntry>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ApiEvent {
     pub id: EventId,
@@ -399,6 +444,7 @@ struct EventsQuery {
 pub enum ApiError {
     Store(StoreError),
     BadRequest { code: &'static str, message: String },
+    InvalidConfig(String),
 }
 
 struct ApiJson<T>(T);
@@ -476,6 +522,9 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let (status, code, message) = match self {
             Self::BadRequest { code, message } => (StatusCode::BAD_REQUEST, code, message),
+            Self::InvalidConfig(message) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "config_invalid", message)
+            }
             Self::Store(StoreError::SessionNotFound(id)) => (
                 StatusCode::NOT_FOUND,
                 "session_not_found",
@@ -607,6 +656,7 @@ pub fn router_with_token(state: AppState, token: Option<String>) -> Router {
         )
         .route("/api/v1/sessions/{session_id}/forks", post(fork_session))
         .route("/api/v1/providers", get(list_providers))
+        .route("/api/v1/config/reload", post(reload_config))
         .route("/api/v1/sessions/{session_id}/runs", post(create_run))
         .route("/api/v1/sessions/{session_id}/runs/{run_id}", get(get_run))
         .route(
@@ -1085,9 +1135,38 @@ async fn fork_session(
     responses((status = 200, body = ProviderCatalogResponse))
 )]
 async fn list_providers(State(state): State<AppState>) -> Json<ProviderCatalogResponse> {
+    let snapshot = state.config_snapshot().await;
     Json(ProviderCatalogResponse {
-        providers: state.config().catalog(),
+        providers: snapshot.config.catalog(),
     })
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/config/reload",
+    responses(
+        (status = 200, body = ConfigReloadResponse),
+        (status = 422, body = ErrorResponse)
+    )
+)]
+async fn reload_config(
+    State(state): State<AppState>,
+) -> Result<Json<ConfigReloadResponse>, ApiError> {
+    match state.reload_config().await {
+        Ok(snapshot) => {
+            let providers = snapshot.config.catalog();
+            Ok(Json(ConfigReloadResponse {
+                revision: snapshot.revision,
+                loaded_at: snapshot.loaded_at,
+                providers,
+            }))
+        }
+        Err(error) => {
+            let message = error.to_string();
+            state.request_fatal_reload_shutdown(message.clone()).await;
+            Err(ApiError::InvalidConfig(message))
+        }
+    }
 }
 
 #[utoipa::path(
@@ -1271,6 +1350,7 @@ fn event_for_sse(event: RecordedEvent) -> Event {
         stream_events,
         fork_session,
         list_providers,
+        reload_config,
         create_run,
         get_run,
         cancel_run,
@@ -1294,7 +1374,8 @@ fn event_for_sse(event: RecordedEvent) -> Event {
         RunAcceptedResponse,
         RunResponse,
         ApiRun,
-        ProviderCatalogResponse
+        ProviderCatalogResponse,
+        ConfigReloadResponse
     )),
     tags(
         (name = "projects", description = "Persistent project grouping API"),

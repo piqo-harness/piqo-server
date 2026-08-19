@@ -306,6 +306,35 @@ inherits its parent session's `project_id`.
 
 Provider and model identifiers are opaque, case-sensitive strings.
 
+Reload the complete configuration from the path selected when the server
+started with an empty-body request:
+
+```http
+POST /api/v1/config/reload
+```
+
+A successful reload atomically replaces the active configuration and returns:
+
+```json
+{
+  "revision": 2,
+  "loaded_at": "2026-08-19T12:00:00.000Z",
+  "providers": []
+}
+```
+
+The revision starts at `1` for each process and increases after every successful
+reload. Active runs, including their automatic retries, keep the configuration
+captured when they started. Queued runs use the latest configuration when they
+start.
+
+An absent, unreadable, syntactically invalid, or structurally invalid file
+returns `422` with `error.code == "config_invalid"`. The server then performs a
+graceful shutdown and exits with a non-zero status. Clients MUST treat the HTTP
+response as the reload result and then follow the normal process-exit recovery
+flow. A missing credential environment variable is not a structural reload
+error; it is reported when the affected provider is used.
+
 ### 4.4 Queue a run
 
 ```http
