@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -62,6 +62,13 @@ impl EventHub {
             channels.remove(session_id);
         }
     }
+
+    pub(crate) async fn close_sessions(&self, session_ids: &[String]) {
+        let mut channels = self.channels.lock().await;
+        for session_id in session_ids {
+            channels.remove(session_id);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +90,7 @@ pub struct SessionSupervisor {
     hub: EventHub,
     locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     cancellations: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    deleting_projects: Arc<Mutex<HashSet<String>>>,
     dump_dir: Option<PathBuf>,
     shutdown: CancellationToken,
     workers: Arc<Mutex<JoinSet<()>>>,
@@ -112,6 +120,7 @@ impl SessionSupervisor {
             hub,
             locks: Arc::new(Mutex::new(HashMap::new())),
             cancellations: Arc::new(Mutex::new(HashMap::new())),
+            deleting_projects: Arc::new(Mutex::new(HashSet::new())),
             dump_dir,
             shutdown,
             workers: Arc::new(Mutex::new(JoinSet::new())),
@@ -186,7 +195,7 @@ impl SessionSupervisor {
         if self.shutdown.is_cancelled() {
             return Err(StoreError::ShuttingDown);
         }
-        self.store.get_session(session_id).await?;
+        self.ensure_session_mutable(session_id).await?;
         if self.store.projection(session_id).await?.queue_paused {
             return Err(StoreError::QueuePaused);
         }
@@ -227,6 +236,7 @@ impl SessionSupervisor {
         if self.shutdown.is_cancelled() {
             return Err(StoreError::ShuttingDown);
         }
+        self.ensure_session_mutable(session_id).await?;
         let projection = self.store.projection(session_id).await?;
         if !projection.queue_paused {
             return Err(StoreError::QueueNotPaused);
@@ -240,6 +250,7 @@ impl SessionSupervisor {
         if self.shutdown.is_cancelled() {
             return Err(StoreError::ShuttingDown);
         }
+        self.ensure_session_mutable(session_id).await?;
         let projection = self.store.projection(session_id).await?;
         let run = projection
             .runs
@@ -274,6 +285,7 @@ impl SessionSupervisor {
         if self.shutdown.is_cancelled() {
             return Err(StoreError::ShuttingDown);
         }
+        self.ensure_session_mutable(session_id).await?;
         let projection = self.store.projection(session_id).await?;
         let run = projection
             .runs
@@ -305,6 +317,86 @@ impl SessionSupervisor {
         self.append_many(session_id, events).await?;
         self.spawn_worker(session_id.to_owned()).await;
         Ok(new_id)
+    }
+
+    pub async fn project_is_deleting(&self, project_id: &str) -> bool {
+        self.deleting_projects.lock().await.contains(project_id)
+    }
+
+    pub async fn delete_project(&self, project_id: &str) -> Result<(), StoreError> {
+        {
+            let mut deleting = self.deleting_projects.lock().await;
+            if !deleting.insert(project_id.to_owned()) {
+                return Err(StoreError::ProjectDeleting(project_id.to_owned()));
+            }
+        }
+
+        let result = async {
+            let session_ids = self.store.project_session_ids(project_id).await?;
+            for session_id in &session_ids {
+                self.cancel_session_for_project_deletion(session_id).await?;
+            }
+            for session_id in &session_ids {
+                self.wait_for_session_idle(session_id).await;
+            }
+            self.hub.close_sessions(&session_ids).await;
+            self.store.delete_project(project_id).await
+        }
+        .await;
+
+        self.deleting_projects.lock().await.remove(project_id);
+        result
+    }
+
+    async fn ensure_session_mutable(&self, session_id: &str) -> Result<(), StoreError> {
+        let session = self.store.get_session(session_id).await?;
+        if let Some(project_id) = session.project_id {
+            if self.project_is_deleting(&project_id).await {
+                return Err(StoreError::ProjectDeleting(project_id));
+            }
+        }
+        Ok(())
+    }
+
+    async fn cancel_session_for_project_deletion(
+        &self,
+        session_id: &str,
+    ) -> Result<(), StoreError> {
+        let projection = self.store.projection(session_id).await?;
+        let mut events = Vec::new();
+        for run in projection.runs.values() {
+            match run.status {
+                RunStatus::Queued | RunStatus::RequiresAction => {
+                    events.push(SemanticEvent::RunCancelled {
+                        run_id: run.run_id.clone(),
+                        reason: Some("project_deleted".to_owned()),
+                    })
+                }
+                RunStatus::Running => {
+                    if let Some(token) = self.cancellations.lock().await.get(&run.run_id).cloned() {
+                        token.cancel();
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !events.is_empty() {
+            self.append_many(session_id, events).await?;
+        }
+        Ok(())
+    }
+
+    async fn wait_for_session_idle(&self, session_id: &str) {
+        let lock = {
+            let mut locks = self.locks.lock().await;
+            locks
+                .entry(session_id.to_owned())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let guard = lock.lock().await;
+        drop(guard);
+        self.release_session_lock(session_id, &lock).await;
     }
 
     async fn spawn_worker(&self, session_id: String) {
@@ -1303,7 +1395,10 @@ mod tests {
             None,
             CancellationToken::new(),
         );
-        let session = store.create_session(None).await.expect("session creates");
+        let session = store
+            .create_session(None, None)
+            .await
+            .expect("session creates");
         let run_id = supervisor
             .queue_run(
                 &session.id,
@@ -1370,7 +1465,10 @@ mod tests {
         let store = SqliteStore::connect_file(file.path())
             .await
             .expect("store opens");
-        let session = store.create_session(None).await.expect("session creates");
+        let session = store
+            .create_session(None, None)
+            .await
+            .expect("session creates");
         store
             .append_events(
                 &session.id,
@@ -1426,5 +1524,97 @@ mod tests {
             .runs
             .values()
             .all(|run| run.error.as_deref() == Some("server_shutdown")));
+    }
+
+    #[tokio::test]
+    async fn deleting_a_project_cancels_active_work_and_closes_its_streams() {
+        let file = NamedTempFile::new().expect("temporary sqlite file");
+        let store = SqliteStore::connect_file(file.path())
+            .await
+            .expect("store opens");
+        let project = store
+            .create_project("demo".into(), "/workspace/demo".into())
+            .await
+            .expect("project creates");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock provider binds");
+        let address = listener.local_addr().expect("mock provider address");
+        let provider_task = tokio::spawn(async move {
+            let (_connection, _) = listener.accept().await.expect("provider accepts");
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let config: PiqoConfig = toml::from_str(&format!(
+            "[providers.local]\nbase_url = \"http://{address}\"\n"
+        ))
+        .expect("provider config parses");
+        let hub = EventHub::new();
+        let session = store
+            .create_session(None, Some(project.id.clone()))
+            .await
+            .expect("session creates");
+        let mut stream = hub.subscribe(&session.id).await;
+        let supervisor = SessionSupervisor::with_dump_dir_and_shutdown(
+            store.clone(),
+            Arc::new(config),
+            hub,
+            None,
+            CancellationToken::new(),
+        );
+        let run_id = supervisor
+            .queue_run(
+                &session.id,
+                RunRequest {
+                    provider: "local".into(),
+                    model: "test-model".into(),
+                    input: json!("hello"),
+                    agent: None,
+                    variant: None,
+                    body: json!({}),
+                },
+            )
+            .await
+            .expect("run queues");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let projection = store
+                    .projection(&session.id)
+                    .await
+                    .expect("projection loads");
+                if projection
+                    .runs
+                    .get(&run_id)
+                    .is_some_and(|run| run.status == RunStatus::Running)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("run starts");
+
+        supervisor
+            .delete_project(&project.id)
+            .await
+            .expect("project deletes");
+        assert!(matches!(
+            store.get_session(&session.id).await,
+            Err(StoreError::SessionNotFound(_))
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    stream.recv().await,
+                    Err(broadcast::error::RecvError::Closed)
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("session stream closes");
+        provider_task.abort();
     }
 }

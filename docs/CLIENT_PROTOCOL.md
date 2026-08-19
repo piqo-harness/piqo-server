@@ -206,7 +206,39 @@ spawn -> ready -> health -> create/get session -> open SSE -> queue run
 Opening SSE before queueing a run avoids missing live output. Event replay makes
 the order safe even when requests race or the stream reconnects.
 
-### 4.1 Sessions
+### 4.1 Projects
+
+A project represents one existing local directory (including a repository root).
+Its `path` is an absolute, canonical path and is unique. Create one with:
+
+```http
+POST /api/v1/projects
+Content-Type: application/json
+
+{"name":"Piqo","path":"/Users/example/src/piqo"}
+```
+
+The response is `201` with:
+
+```json
+{"id":"opaque-project-id","name":"Piqo","path":"/Users/example/src/piqo","created_at":"timestamp","updated_at":"timestamp"}
+```
+
+`GET /api/v1/projects?limit=50&cursor=<opaque>` lists projects. Use `GET`,
+`PATCH`, and `DELETE /api/v1/projects/{project_id}` to inspect, update, and
+delete a project. A patch accepts either or both of `name` and `path`; a path
+is validated and canonicalized again.
+
+Use `GET /api/v1/projects/{project_id}/sessions?limit=50&cursor=<opaque>` to
+load the sessions for each project group. `GET /api/v1/sessions?unassigned=true`
+returns the separate group of sessions with no project.
+
+Deleting a project cancels its queued or active runs, then permanently deletes
+the project, all of its sessions, and their event logs. A client MUST treat a
+successful `204` as irreversible. While this work is in progress, mutations
+for its sessions return `409/project_deleting`.
+
+### 4.2 Sessions
 
 Create a session:
 
@@ -214,15 +246,17 @@ Create a session:
 POST /api/v1/sessions
 Content-Type: application/json
 
-{"title":"Optional title"}
+{"title":"Optional title","project_id":"opaque-project-id"}
 ```
 
-`title` may be `null` or omitted. Success is `201` with a session summary:
+`title` and `project_id` may be `null` or omitted. A non-null `project_id`
+must identify an existing project. Success is `201` with a session summary:
 
 ```json
 {
   "id": "opaque-session-id",
   "title": "Optional title",
+  "project_id": "opaque-project-id",
   "parent_session_id": null,
   "forked_at_event_id": null,
   "created_at": "timestamp",
@@ -249,9 +283,10 @@ Content-Type: application/json
 ```
 
 Success is `201` with the new session summary. A fork is a new session; its ID
-MUST replace the parent ID for subsequent operations on that branch.
+MUST replace the parent ID for subsequent operations on that branch. A fork
+inherits its parent session's `project_id`.
 
-### 4.2 Provider catalog
+### 4.3 Provider catalog
 
 `GET /api/v1/providers` returns:
 
@@ -271,7 +306,7 @@ MUST replace the parent ID for subsequent operations on that branch.
 
 Provider and model identifiers are opaque, case-sensitive strings.
 
-### 4.3 Queue a run
+### 4.4 Queue a run
 
 ```http
 POST /api/v1/sessions/{session_id}/runs

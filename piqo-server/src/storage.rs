@@ -26,6 +26,7 @@ pub struct SqliteStore {
 pub struct SessionSummary {
     pub id: String,
     pub title: Option<String>,
+    pub project_id: Option<String>,
     pub parent_session_id: Option<String>,
     pub forked_at_event_id: Option<EventId>,
     pub created_at: String,
@@ -33,6 +34,15 @@ pub struct SessionSummary {
     pub phase: SessionPhase,
     pub revision: u64,
     pub last_event_id: EventId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Project {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Error)]
@@ -45,6 +55,12 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("session {0} was not found")]
     SessionNotFound(String),
+    #[error("project {0} was not found")]
+    ProjectNotFound(String),
+    #[error("a project already uses path {0}")]
+    ProjectPathConflict(String),
+    #[error("project {0} is being deleted")]
+    ProjectDeleting(String),
     #[error("event {event_id} was not found in session {session_id}")]
     EventNotFound {
         session_id: String,
@@ -143,16 +159,21 @@ impl SqliteStore {
     pub async fn create_session(
         &self,
         title: Option<String>,
+        project_id: Option<String>,
     ) -> Result<SessionSummary, StoreError> {
         let id = Uuid::now_v7().to_string();
         let now = now();
         let mut tx = self.pool.begin().await?;
+        if let Some(project_id) = &project_id {
+            ensure_project_in_transaction(&mut tx, project_id).await?;
+        }
         sqlx::query(
-            "INSERT INTO sessions (id, title, created_at, updated_at, phase, revision, last_event_id)
-             VALUES (?, ?, ?, ?, 'created', 0, 1)",
+            "INSERT INTO sessions (id, title, project_id, created_at, updated_at, phase, revision, last_event_id)
+             VALUES (?, ?, ?, ?, ?, 'created', 0, 1)",
         )
         .bind(&id)
         .bind(&title)
+        .bind(&project_id)
         .bind(&now)
         .bind(&now)
         .execute(&mut *tx)
@@ -171,7 +192,7 @@ impl SqliteStore {
 
     pub async fn get_session(&self, session_id: &str) -> Result<SessionSummary, StoreError> {
         let row = sqlx::query(
-            "SELECT id, title, parent_session_id, forked_at_event_id, created_at, updated_at,
+            "SELECT id, title, project_id, parent_session_id, forked_at_event_id, created_at, updated_at,
                     phase, revision, last_event_id
              FROM sessions WHERE id = ?",
         )
@@ -204,7 +225,7 @@ impl SqliteStore {
         let rows = if let Some(cursor) = cursor {
             let (created_at, id) = decode_cursor(cursor)?;
             sqlx::query(
-                "SELECT id, title, parent_session_id, forked_at_event_id, created_at, updated_at,
+                "SELECT id, title, project_id, parent_session_id, forked_at_event_id, created_at, updated_at,
                         phase, revision, last_event_id
                  FROM sessions
                  WHERE (created_at, id) < (?, ?)
@@ -217,7 +238,7 @@ impl SqliteStore {
             .await?
         } else {
             sqlx::query(
-                "SELECT id, title, parent_session_id, forked_at_event_id, created_at, updated_at,
+                "SELECT id, title, project_id, parent_session_id, forked_at_event_id, created_at, updated_at,
                         phase, revision, last_event_id
                  FROM sessions ORDER BY created_at DESC, id DESC LIMIT ?",
             )
@@ -238,6 +259,188 @@ impl SqliteStore {
             None
         };
         Ok((summaries, next))
+    }
+
+    pub async fn list_unassigned_sessions(
+        &self,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<(Vec<SessionSummary>, Option<String>), StoreError> {
+        self.list_sessions_by_clause("project_id IS NULL", None, cursor, limit)
+            .await
+    }
+
+    pub async fn list_project_sessions(
+        &self,
+        project_id: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<(Vec<SessionSummary>, Option<String>), StoreError> {
+        self.get_project(project_id).await?;
+        self.list_sessions_by_clause("project_id = ?", Some(project_id), cursor, limit)
+            .await
+    }
+
+    async fn list_sessions_by_clause(
+        &self,
+        clause: &str,
+        project_id: Option<&str>,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<(Vec<SessionSummary>, Option<String>), StoreError> {
+        let limit = limit.clamp(1, 200);
+        let query = if cursor.is_some() {
+            format!(
+                "SELECT id, title, project_id, parent_session_id, forked_at_event_id, created_at, updated_at, phase, revision, last_event_id
+                 FROM sessions WHERE {clause} AND (created_at, id) < (?, ?)
+                 ORDER BY created_at DESC, id DESC LIMIT ?"
+            )
+        } else {
+            format!(
+                "SELECT id, title, project_id, parent_session_id, forked_at_event_id, created_at, updated_at, phase, revision, last_event_id
+                 FROM sessions WHERE {clause} ORDER BY created_at DESC, id DESC LIMIT ?"
+            )
+        };
+        let mut query = sqlx::query(&query);
+        if let Some(project_id) = project_id {
+            query = query.bind(project_id);
+        }
+        if let Some(cursor) = cursor {
+            let (created_at, id) = decode_cursor(cursor)?;
+            query = query.bind(created_at).bind(id);
+        }
+        let rows = query
+            .bind(i64::from(limit) + 1)
+            .fetch_all(&self.pool)
+            .await?;
+        let has_more = rows.len() > limit as usize;
+        let summaries = rows
+            .into_iter()
+            .take(limit as usize)
+            .map(|row| summary_from_row(&row))
+            .collect::<Result<Vec<_>, _>>()?;
+        let next_cursor = has_more.then(|| {
+            let last = summaries
+                .last()
+                .expect("a page with more entries is non-empty");
+            encode_cursor(&last.created_at, &last.id)
+        });
+        Ok((summaries, next_cursor))
+    }
+
+    pub async fn create_project(&self, name: String, path: String) -> Result<Project, StoreError> {
+        let id = Uuid::now_v7().to_string();
+        let timestamp = now();
+        sqlx::query(
+            "INSERT INTO projects (id, name, path, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(&name)
+        .bind(&path)
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| map_project_write_error(error, &path))?;
+        self.get_project(&id).await
+    }
+
+    pub async fn list_projects(
+        &self,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<(Vec<Project>, Option<String>), StoreError> {
+        let limit = limit.clamp(1, 200);
+        let rows = if let Some(cursor) = cursor {
+            let (created_at, id) = decode_cursor(cursor)?;
+            sqlx::query(
+                "SELECT id, name, path, created_at, updated_at FROM projects
+                 WHERE (created_at, id) < (?, ?) ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(created_at)
+            .bind(id)
+            .bind(i64::from(limit) + 1)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT id, name, path, created_at, updated_at FROM projects
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(i64::from(limit) + 1)
+            .fetch_all(&self.pool)
+            .await?
+        };
+        let has_more = rows.len() > limit as usize;
+        let projects = rows
+            .into_iter()
+            .take(limit as usize)
+            .map(|row| project_from_row(&row))
+            .collect::<Result<Vec<_>, _>>()?;
+        let next_cursor = has_more.then(|| {
+            let last = projects
+                .last()
+                .expect("a page with more entries is non-empty");
+            encode_cursor(&last.created_at, &last.id)
+        });
+        Ok((projects, next_cursor))
+    }
+
+    pub async fn get_project(&self, project_id: &str) -> Result<Project, StoreError> {
+        let row =
+            sqlx::query("SELECT id, name, path, created_at, updated_at FROM projects WHERE id = ?")
+                .bind(project_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .ok_or_else(|| StoreError::ProjectNotFound(project_id.to_owned()))?;
+        project_from_row(&row)
+    }
+
+    pub async fn update_project(
+        &self,
+        project_id: &str,
+        name: Option<String>,
+        path: Option<String>,
+    ) -> Result<Project, StoreError> {
+        let current = self.get_project(project_id).await?;
+        let name = name.unwrap_or(current.name);
+        let path = path.unwrap_or(current.path);
+        let timestamp = now();
+        sqlx::query("UPDATE projects SET name = ?, path = ?, updated_at = ? WHERE id = ?")
+            .bind(&name)
+            .bind(&path)
+            .bind(&timestamp)
+            .bind(project_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|error| map_project_write_error(error, &path))?;
+        self.get_project(project_id).await
+    }
+
+    pub(crate) async fn project_session_ids(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        self.get_project(project_id).await?;
+        Ok(
+            sqlx::query_scalar("SELECT id FROM sessions WHERE project_id = ? ORDER BY id")
+                .bind(project_id)
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
+    pub async fn delete_project(&self, project_id: &str) -> Result<(), StoreError> {
+        let session_ids = self.project_session_ids(project_id).await?;
+        sqlx::query("DELETE FROM projects WHERE id = ?")
+            .bind(project_id)
+            .execute(&self.pool)
+            .await?;
+        let mut cache = self.projection_cache.lock().await;
+        for session_id in session_ids {
+            cache.remove(&session_id);
+        }
+        Ok(())
     }
 
     pub(crate) async fn session_ids(&self) -> Result<Vec<String>, StoreError> {
@@ -377,14 +580,12 @@ impl SqliteStore {
         title: Option<String>,
     ) -> Result<SessionSummary, StoreError> {
         let mut tx = self.pool.begin().await?;
-        let parent_exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM sessions WHERE id = ?")
-            .bind(parent_session_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .is_some();
-        if !parent_exists {
-            return Err(StoreError::SessionNotFound(parent_session_id.to_owned()));
-        }
+        let parent_project_id =
+            sqlx::query_scalar::<_, Option<String>>("SELECT project_id FROM sessions WHERE id = ?")
+                .bind(parent_session_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| StoreError::SessionNotFound(parent_session_id.to_owned()))?;
         let rows = sqlx::query(
             "SELECT event_id, schema_version, type, data, occurred_at FROM events
              WHERE session_id = ? AND event_id <= ? ORDER BY event_id ASC",
@@ -413,11 +614,12 @@ impl SqliteStore {
         let created_at = now();
         sqlx::query(
             "INSERT INTO sessions
-             (id, title, parent_session_id, forked_at_event_id, created_at, updated_at, phase, revision, last_event_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (id, title, project_id, parent_session_id, forked_at_event_id, created_at, updated_at, phase, revision, last_event_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(title)
+        .bind(parent_project_id)
         .bind(parent_session_id)
         .bind(i64::try_from(at_event_id).map_err(|_| StoreError::InvalidCursor)?)
         .bind(&created_at)
@@ -610,6 +812,7 @@ fn summary_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SessionSummary, Sto
     Ok(SessionSummary {
         id: row.try_get("id")?,
         title: row.try_get("title")?,
+        project_id: row.try_get("project_id")?,
         parent_session_id: row.try_get("parent_session_id")?,
         forked_at_event_id: row
             .try_get::<Option<i64>, _>("forked_at_event_id")?
@@ -625,6 +828,44 @@ fn summary_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SessionSummary, Sto
         last_event_id: u64::try_from(row.try_get::<i64, _>("last_event_id")?)
             .map_err(|_| sqlx::Error::Protocol("negative event id".into()))?,
     })
+}
+
+fn project_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Project, StoreError> {
+    Ok(Project {
+        id: row.try_get("id")?,
+        name: row.try_get("name")?,
+        path: row.try_get("path")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+async fn ensure_project_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    project_id: &str,
+) -> Result<(), StoreError> {
+    let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM projects WHERE id = ?")
+        .bind(project_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .is_some();
+    if exists {
+        Ok(())
+    } else {
+        Err(StoreError::ProjectNotFound(project_id.to_owned()))
+    }
+}
+
+fn map_project_write_error(error: sqlx::Error, path: &str) -> StoreError {
+    if error
+        .as_database_error()
+        .and_then(|database_error| database_error.code())
+        .is_some_and(|code| code == "2067" || code == "1555")
+    {
+        StoreError::ProjectPathConflict(path.to_owned())
+    } else {
+        StoreError::Database(error)
+    }
 }
 
 fn parse_phase(value: String) -> Result<SessionPhase, StoreError> {
@@ -678,7 +919,7 @@ mod tests {
     async fn persists_events_and_reopens_with_the_same_projection() {
         let (store, file) = store().await;
         let session = store
-            .create_session(Some("demo".into()))
+            .create_session(Some("demo".into()), None)
             .await
             .expect("session creates");
         store
@@ -707,7 +948,10 @@ mod tests {
     #[tokio::test]
     async fn forks_an_autonomous_prefix_and_marks_it_interrupted() {
         let (store, _file) = store().await;
-        let parent = store.create_session(None).await.expect("session creates");
+        let parent = store
+            .create_session(None, None)
+            .await
+            .expect("session creates");
         let child = store
             .fork_session(&parent.id, 1, Some("branch".into()))
             .await
@@ -728,7 +972,10 @@ mod tests {
     #[tokio::test]
     async fn fork_interrupts_an_active_run_and_suspends_the_branch() {
         let (store, _file) = store().await;
-        let parent = store.create_session(None).await.expect("session creates");
+        let parent = store
+            .create_session(None, None)
+            .await
+            .expect("session creates");
         store
             .append_event(
                 &parent.id,
@@ -781,7 +1028,10 @@ mod tests {
     #[tokio::test]
     async fn allocates_unique_monotonic_ids_for_concurrent_appends() {
         let (store, _file) = store().await;
-        let session = store.create_session(None).await.expect("session creates");
+        let session = store
+            .create_session(None, None)
+            .await
+            .expect("session creates");
         let store = Arc::new(store);
         let mut tasks = Vec::new();
         for index in 0..8 {
@@ -817,7 +1067,10 @@ mod tests {
     #[tokio::test]
     async fn recovery_marks_a_running_session_once() {
         let (store, file) = store().await;
-        let session = store.create_session(None).await.expect("session creates");
+        let session = store
+            .create_session(None, None)
+            .await
+            .expect("session creates");
         store
             .append_event(
                 &session.id,
@@ -863,8 +1116,14 @@ mod tests {
     #[tokio::test]
     async fn paginates_sessions_with_a_stable_cursor() {
         let (store, _file) = store().await;
-        let first = store.create_session(None).await.expect("session creates");
-        let second = store.create_session(None).await.expect("session creates");
+        let first = store
+            .create_session(None, None)
+            .await
+            .expect("session creates");
+        let second = store
+            .create_session(None, None)
+            .await
+            .expect("session creates");
         let (page, cursor) = store
             .list_sessions(None, 1)
             .await
@@ -885,14 +1144,97 @@ mod tests {
         let store = SqliteStore::connect("sqlite::memory:")
             .await
             .expect("in-memory store opens");
-        let session = store.create_session(None).await.expect("session creates");
+        let session = store
+            .create_session(None, None)
+            .await
+            .expect("session creates");
         assert_eq!(session.last_event_id, 1);
+    }
+
+    #[tokio::test]
+    async fn projects_group_sessions_and_delete_them_in_a_cascade() {
+        let (store, _file) = store().await;
+        let project = store
+            .create_project("demo".into(), "/workspace/demo".into())
+            .await
+            .expect("project creates");
+        let session = store
+            .create_session(Some("grouped".into()), Some(project.id.clone()))
+            .await
+            .expect("project session creates");
+        let fork = store
+            .fork_session(&session.id, 1, None)
+            .await
+            .expect("fork creates");
+        let unassigned = store
+            .create_session(Some("unassigned".into()), None)
+            .await
+            .expect("unassigned session creates");
+
+        let (grouped, _) = store
+            .list_project_sessions(&project.id, None, 50)
+            .await
+            .expect("project sessions list");
+        assert_eq!(grouped.len(), 2);
+        assert!(grouped
+            .iter()
+            .all(|summary| summary.project_id.as_deref() == Some(project.id.as_str())));
+        assert_eq!(fork.project_id.as_deref(), Some(project.id.as_str()));
+
+        let (unassigned_sessions, _) = store
+            .list_unassigned_sessions(None, 50)
+            .await
+            .expect("unassigned sessions list");
+        assert_eq!(unassigned_sessions.len(), 1);
+        assert_eq!(unassigned_sessions[0].id, unassigned.id);
+
+        store
+            .delete_project(&project.id)
+            .await
+            .expect("project deletes");
+        assert!(matches!(
+            store.get_session(&session.id).await,
+            Err(StoreError::SessionNotFound(_))
+        ));
+        assert!(matches!(
+            store.events(&fork.id, 0, 10).await,
+            Err(StoreError::SessionNotFound(_))
+        ));
+        assert!(store.get_session(&unassigned.id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn projects_reject_duplicate_paths_and_support_updates() {
+        let (store, _file) = store().await;
+        let project = store
+            .create_project("first".into(), "/workspace/one".into())
+            .await
+            .expect("project creates");
+        assert!(matches!(
+            store
+                .create_project("second".into(), "/workspace/one".into())
+                .await,
+            Err(StoreError::ProjectPathConflict(_))
+        ));
+        let updated = store
+            .update_project(
+                &project.id,
+                Some("renamed".into()),
+                Some("/workspace/two".into()),
+            )
+            .await
+            .expect("project updates");
+        assert_eq!(updated.name, "renamed");
+        assert_eq!(updated.path, "/workspace/two");
     }
 
     #[tokio::test]
     async fn fork_copies_unknown_additive_event_fields_verbatim() {
         let (store, _file) = store().await;
-        let parent = store.create_session(None).await.expect("session creates");
+        let parent = store
+            .create_session(None, None)
+            .await
+            .expect("session creates");
         store
             .append_event(
                 &parent.id,
