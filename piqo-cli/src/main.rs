@@ -50,6 +50,9 @@ enum Command {
         server: String,
         #[arg(long)]
         session: Option<String>,
+        /// Project to associate with a newly created session.
+        #[arg(long)]
+        project: Option<String>,
         #[arg(long, env = "PIQO_SERVER_TOKEN")]
         token: Option<String>,
         #[arg(long, default_value = "omlx")]
@@ -58,6 +61,67 @@ enum Command {
         model: String,
         #[arg(long)]
         json: bool,
+    },
+    /// Manage durable project groups.
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProjectCommand {
+    /// Create a project from an existing local directory.
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        server: String,
+        #[arg(long, env = "PIQO_SERVER_TOKEN")]
+        token: Option<String>,
+    },
+    /// List projects.
+    List {
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        server: String,
+        #[arg(long, env = "PIQO_SERVER_TOKEN")]
+        token: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Show a project.
+    Get {
+        project_id: String,
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        server: String,
+        #[arg(long, env = "PIQO_SERVER_TOKEN")]
+        token: Option<String>,
+    },
+    /// Rename a project or point it at a different directory.
+    Update {
+        project_id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        path: Option<PathBuf>,
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        server: String,
+        #[arg(long, env = "PIQO_SERVER_TOKEN")]
+        token: Option<String>,
+    },
+    /// Delete a project and all of its sessions.
+    Delete {
+        project_id: String,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        server: String,
+        #[arg(long, env = "PIQO_SERVER_TOKEN")]
+        token: Option<String>,
     },
 }
 
@@ -129,11 +193,13 @@ async fn main() -> Result<()> {
             prompt,
             server,
             session,
+            project,
             token,
             provider,
             model,
             json: json_output,
         } => {
+            validate_run_options(session.as_deref(), project.as_deref())?;
             let client = Client::builder()
                 .connect_timeout(Duration::from_secs(10))
                 .build()?;
@@ -146,7 +212,7 @@ async fn main() -> Result<()> {
                         request = request.bearer_auth(token);
                     }
                     let response = request
-                        .json(&json!({}))
+                        .json(&json!({"project_id": project}))
                         .send()
                         .await
                         .context("connecting to piqo daemon")?
@@ -191,6 +257,120 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
+        Command::Project { command } => run_project_command(command).await?,
+    }
+    Ok(())
+}
+
+async fn run_project_command(command: ProjectCommand) -> Result<()> {
+    let client = Client::new();
+    match command {
+        ProjectCommand::Create {
+            name,
+            path,
+            server,
+            token,
+        } => {
+            let response = authenticated(client.post(format!("{server}/api/v1/projects")), token)
+                .json(&json!({"name": name, "path": path}))
+                .send()
+                .await?
+                .error_for_status()?;
+            print_json(response).await
+        }
+        ProjectCommand::List {
+            server,
+            token,
+            limit,
+            cursor,
+        } => {
+            let mut request = client.get(format!("{server}/api/v1/projects"));
+            if let Some(limit) = limit {
+                request = request.query(&[("limit", limit.to_string())]);
+            }
+            if let Some(cursor) = cursor {
+                request = request.query(&[("cursor", cursor)]);
+            }
+            let response = authenticated(request, token)
+                .send()
+                .await?
+                .error_for_status()?;
+            print_json(response).await
+        }
+        ProjectCommand::Get {
+            project_id,
+            server,
+            token,
+        } => {
+            let response = authenticated(
+                client.get(format!("{server}/api/v1/projects/{project_id}")),
+                token,
+            )
+            .send()
+            .await?
+            .error_for_status()?;
+            print_json(response).await
+        }
+        ProjectCommand::Update {
+            project_id,
+            name,
+            path,
+            server,
+            token,
+        } => {
+            if name.is_none() && path.is_none() {
+                anyhow::bail!("provide at least one of --name or --path");
+            }
+            let response = authenticated(
+                client.patch(format!("{server}/api/v1/projects/{project_id}")),
+                token,
+            )
+            .json(&json!({"name": name, "path": path}))
+            .send()
+            .await?
+            .error_for_status()?;
+            print_json(response).await
+        }
+        ProjectCommand::Delete {
+            project_id,
+            yes,
+            server,
+            token,
+        } => {
+            if !yes {
+                anyhow::bail!("project deletion is destructive; repeat with --yes");
+            }
+            authenticated(
+                client.delete(format!("{server}/api/v1/projects/{project_id}")),
+                token,
+            )
+            .send()
+            .await?
+            .error_for_status()?;
+            Ok(())
+        }
+    }
+}
+
+fn authenticated(
+    request: reqwest::RequestBuilder,
+    token: Option<String>,
+) -> reqwest::RequestBuilder {
+    match token.or_else(|| std::env::var("PIQO_SERVER_TOKEN").ok()) {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    }
+}
+
+async fn print_json(response: reqwest::Response) -> Result<()> {
+    let value: Value = response.json().await?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn validate_run_options(session: Option<&str>, project: Option<&str>) -> Result<()> {
+    if session.is_some() && project.is_some() {
+        anyhow::bail!("--project cannot be used with --session");
     }
     Ok(())
 }
@@ -321,4 +501,27 @@ fn default_config_path() -> PathBuf {
                 .unwrap_or_else(|| PathBuf::from("."))
         })
         .join("piqo/piqo.toml")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_a_project_when_reusing_a_session() {
+        assert!(validate_run_options(Some("session"), Some("project")).is_err());
+        assert!(validate_run_options(None, Some("project")).is_ok());
+    }
+
+    #[test]
+    fn parses_the_destructive_project_delete_confirmation() {
+        let cli = Cli::try_parse_from(["piqo", "project", "delete", "project-id", "--yes"])
+            .expect("CLI parses");
+        assert!(matches!(
+            cli.command,
+            Command::Project {
+                command: ProjectCommand::Delete { yes: true, .. }
+            }
+        ));
+    }
 }

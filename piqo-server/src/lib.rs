@@ -8,6 +8,7 @@ mod supervisor;
 use std::{
     convert::Infallible,
     net::SocketAddr,
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -47,7 +48,7 @@ pub use config::{ConfigError, PiqoConfig, ProviderCatalogEntry, ProviderConfig};
 pub use runtime::{
     ensure_private_directory, prepare_server, PreparedServer, ServerError, ServerOptions,
 };
-pub use storage::{SessionSummary, SqliteStore, StoreError, EVENT_SCHEMA_VERSION};
+pub use storage::{Project, SessionSummary, SqliteStore, StoreError, EVENT_SCHEMA_VERSION};
 use supervisor::EventHub;
 pub use supervisor::{RunRequest, SessionSupervisor};
 
@@ -179,6 +180,46 @@ impl AppState {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateSessionRequest {
     pub title: Option<String>,
+    pub project_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateProjectRequest {
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateProjectRequest {
+    pub name: Option<String>,
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApiProject {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl From<Project> for ApiProject {
+    fn from(project: Project) -> Self {
+        Self {
+            id: project.id,
+            name: project.name,
+            path: project.path,
+            created_at: project.created_at,
+            updated_at: project.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProjectListResponse {
+    pub projects: Vec<ApiProject>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -191,6 +232,7 @@ pub struct SessionListResponse {
 pub struct ApiSessionSummary {
     pub id: String,
     pub title: Option<String>,
+    pub project_id: Option<String>,
     pub parent_session_id: Option<String>,
     pub forked_at_event_id: Option<EventId>,
     pub created_at: String,
@@ -206,6 +248,7 @@ impl From<SessionSummary> for ApiSessionSummary {
         Self {
             id: summary.id,
             title: summary.title,
+            project_id: summary.project_id,
             parent_session_id: summary.parent_session_id,
             forked_at_event_id: summary.forked_at_event_id,
             created_at: summary.created_at,
@@ -343,6 +386,7 @@ struct HealthResponse {
 struct ListQuery {
     cursor: Option<String>,
     limit: Option<u32>,
+    unassigned: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -437,6 +481,21 @@ impl IntoResponse for ApiError {
                 "session_not_found",
                 format!("session {id} was not found"),
             ),
+            Self::Store(StoreError::ProjectNotFound(id)) => (
+                StatusCode::NOT_FOUND,
+                "project_not_found",
+                format!("project {id} was not found"),
+            ),
+            Self::Store(StoreError::ProjectPathConflict(path)) => (
+                StatusCode::CONFLICT,
+                "project_path_conflict",
+                format!("a project already uses path {path}"),
+            ),
+            Self::Store(StoreError::ProjectDeleting(id)) => (
+                StatusCode::CONFLICT,
+                "project_deleting",
+                format!("project {id} is being deleted"),
+            ),
             Self::Store(StoreError::EventNotFound {
                 session_id,
                 event_id,
@@ -528,6 +587,17 @@ pub fn router_with_token(state: AppState, token: Option<String>) -> Router {
     let mut router = Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/openapi.json", get(openapi))
+        .route("/api/v1/projects", post(create_project).get(list_projects))
+        .route(
+            "/api/v1/projects/{project_id}",
+            get(get_project)
+                .patch(update_project)
+                .delete(delete_project),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/sessions",
+            get(list_project_sessions),
+        )
         .route("/api/v1/sessions", post(create_session).get(list_sessions))
         .route("/api/v1/sessions/{session_id}", get(get_session))
         .route("/api/v1/sessions/{session_id}/events", get(get_events))
@@ -653,6 +723,46 @@ async fn api_method_not_allowed() -> impl IntoResponse {
     )
 }
 
+fn validated_project_name(name: String) -> Result<String, ApiError> {
+    let name = name.trim().to_owned();
+    if name.is_empty() {
+        return Err(ApiError::BadRequest {
+            code: "invalid_request",
+            message: "project name must not be empty".to_owned(),
+        });
+    }
+    Ok(name)
+}
+
+async fn canonical_project_path(path: String) -> Result<String, ApiError> {
+    let path = PathBuf::from(path);
+    if !path.is_absolute() {
+        return Err(ApiError::BadRequest {
+            code: "invalid_request",
+            message: "project path must be absolute".to_owned(),
+        });
+    }
+    let canonical = tokio::fs::canonicalize(&path)
+        .await
+        .map_err(|error| ApiError::BadRequest {
+            code: "invalid_request",
+            message: format!("project path cannot be resolved: {error}"),
+        })?;
+    let metadata = tokio::fs::metadata(&canonical)
+        .await
+        .map_err(|error| ApiError::BadRequest {
+            code: "invalid_request",
+            message: format!("project path cannot be inspected: {error}"),
+        })?;
+    if !metadata.is_dir() {
+        return Err(ApiError::BadRequest {
+            code: "invalid_request",
+            message: "project path must be a directory".to_owned(),
+        });
+    }
+    Ok(canonical.to_string_lossy().into_owned())
+}
+
 #[utoipa::path(get, path = "/api/v1/health", responses((status = 200, body = HealthResponse)))]
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
@@ -660,6 +770,124 @@ async fn health() -> Json<HealthResponse> {
         server_version: SERVER_VERSION,
         api_version: API_VERSION,
     })
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/projects",
+    request_body = CreateProjectRequest,
+    responses((status = 201, body = ApiProject), (status = 400, body = ErrorResponse), (status = 409, body = ErrorResponse))
+)]
+async fn create_project(
+    State(state): State<AppState>,
+    ApiJson(request): ApiJson<CreateProjectRequest>,
+) -> Result<(StatusCode, Json<ApiProject>), ApiError> {
+    let name = validated_project_name(request.name)?;
+    let path = canonical_project_path(request.path).await?;
+    let project = state.store.create_project(name, path).await?;
+    Ok((StatusCode::CREATED, Json(ApiProject::from(project))))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects",
+    params(("cursor" = Option<String>, Query), ("limit" = Option<u32>, Query)),
+    responses((status = 200, body = ProjectListResponse), (status = 400, body = ErrorResponse))
+)]
+async fn list_projects(
+    State(state): State<AppState>,
+    ApiQuery(query): ApiQuery<ListQuery>,
+) -> Result<Json<ProjectListResponse>, ApiError> {
+    let (projects, next_cursor) = state
+        .store
+        .list_projects(query.cursor.as_deref(), query.limit.unwrap_or(50))
+        .await?;
+    Ok(Json(ProjectListResponse {
+        projects: projects.into_iter().map(ApiProject::from).collect(),
+        next_cursor,
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects/{project_id}",
+    params(("project_id" = String, Path)),
+    responses((status = 200, body = ApiProject), (status = 404, body = ErrorResponse))
+)]
+async fn get_project(
+    State(state): State<AppState>,
+    ApiPath(project_id): ApiPath<String>,
+) -> Result<Json<ApiProject>, ApiError> {
+    Ok(Json(ApiProject::from(
+        state.store.get_project(&project_id).await?,
+    )))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/projects/{project_id}",
+    params(("project_id" = String, Path)),
+    request_body = UpdateProjectRequest,
+    responses((status = 200, body = ApiProject), (status = 400, body = ErrorResponse), (status = 404, body = ErrorResponse), (status = 409, body = ErrorResponse))
+)]
+async fn update_project(
+    State(state): State<AppState>,
+    ApiPath(project_id): ApiPath<String>,
+    ApiJson(request): ApiJson<UpdateProjectRequest>,
+) -> Result<Json<ApiProject>, ApiError> {
+    if request.name.is_none() && request.path.is_none() {
+        return Err(ApiError::BadRequest {
+            code: "invalid_request",
+            message: "at least one of name or path is required".to_owned(),
+        });
+    }
+    let name = request.name.map(validated_project_name).transpose()?;
+    let path = match request.path {
+        Some(path) => Some(canonical_project_path(path).await?),
+        None => None,
+    };
+    Ok(Json(ApiProject::from(
+        state.store.update_project(&project_id, name, path).await?,
+    )))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/v1/projects/{project_id}",
+    params(("project_id" = String, Path)),
+    responses((status = 204), (status = 404, body = ErrorResponse), (status = 409, body = ErrorResponse))
+)]
+async fn delete_project(
+    State(state): State<AppState>,
+    ApiPath(project_id): ApiPath<String>,
+) -> Result<StatusCode, ApiError> {
+    state.supervisor().delete_project(&project_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects/{project_id}/sessions",
+    params(("project_id" = String, Path), ("cursor" = Option<String>, Query), ("limit" = Option<u32>, Query)),
+    responses((status = 200, body = SessionListResponse), (status = 404, body = ErrorResponse))
+)]
+async fn list_project_sessions(
+    State(state): State<AppState>,
+    ApiPath(project_id): ApiPath<String>,
+    ApiQuery(query): ApiQuery<ListQuery>,
+) -> Result<Json<SessionListResponse>, ApiError> {
+    let (sessions, next_cursor) = state
+        .store
+        .list_project_sessions(
+            &project_id,
+            query.cursor.as_deref(),
+            query.limit.unwrap_or(50),
+        )
+        .await?;
+    Ok(Json(SessionListResponse {
+        sessions: sessions.into_iter().map(ApiSessionSummary::from).collect(),
+        next_cursor,
+    }))
 }
 
 #[utoipa::path(
@@ -672,10 +900,20 @@ async fn create_session(
     State(state): State<AppState>,
     ApiJson(request): ApiJson<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<ApiSessionSummary>), ApiError> {
+    if let Some(project_id) = request.project_id.as_deref() {
+        if state.supervisor().project_is_deleting(project_id).await {
+            return Err(ApiError::Store(StoreError::ProjectDeleting(
+                project_id.to_owned(),
+            )));
+        }
+    }
     Ok((
         StatusCode::CREATED,
         Json(ApiSessionSummary::from(
-            state.store.create_session(request.title).await?,
+            state
+                .store
+                .create_session(request.title, request.project_id)
+                .await?,
         )),
     ))
 }
@@ -691,10 +929,17 @@ async fn list_sessions(
     ApiQuery(query): ApiQuery<ListQuery>,
 ) -> Result<Json<SessionListResponse>, ApiError> {
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let (sessions, next_cursor) = state
-        .store
-        .list_sessions(query.cursor.as_deref(), limit)
-        .await?;
+    let (sessions, next_cursor) = if query.unassigned.unwrap_or(false) {
+        state
+            .store
+            .list_unassigned_sessions(query.cursor.as_deref(), limit)
+            .await?
+    } else {
+        state
+            .store
+            .list_sessions(query.cursor.as_deref(), limit)
+            .await?
+    };
     Ok(Json(SessionListResponse {
         sessions: sessions.into_iter().map(ApiSessionSummary::from).collect(),
         next_cursor,
@@ -818,6 +1063,11 @@ async fn fork_session(
     ApiPath(session_id): ApiPath<String>,
     ApiJson(request): ApiJson<ForkSessionRequest>,
 ) -> Result<(StatusCode, Json<ApiSessionSummary>), ApiError> {
+    if let Some(project_id) = state.store.get_session(&session_id).await?.project_id {
+        if state.supervisor().project_is_deleting(&project_id).await {
+            return Err(ApiError::Store(StoreError::ProjectDeleting(project_id)));
+        }
+    }
     Ok((
         StatusCode::CREATED,
         Json(ApiSessionSummary::from(
@@ -1008,6 +1258,12 @@ fn event_for_sse(event: RecordedEvent) -> Event {
     security(("bearerAuth" = [])),
     paths(
         health,
+        create_project,
+        list_projects,
+        get_project,
+        update_project,
+        delete_project,
+        list_project_sessions,
         create_session,
         list_sessions,
         get_session,
@@ -1023,6 +1279,10 @@ fn event_for_sse(event: RecordedEvent) -> Event {
     ),
     components(schemas(
         HealthResponse,
+        CreateProjectRequest,
+        UpdateProjectRequest,
+        ApiProject,
+        ProjectListResponse,
         CreateSessionRequest,
         ApiSessionSummary,
         SessionListResponse,
@@ -1036,7 +1296,10 @@ fn event_for_sse(event: RecordedEvent) -> Event {
         ApiRun,
         ProviderCatalogResponse
     )),
-    tags((name = "sessions", description = "Durable session and event-log API"))
+    tags(
+        (name = "projects", description = "Persistent project grouping API"),
+        (name = "sessions", description = "Durable session and event-log API")
+    )
 )]
 pub struct ApiDoc;
 
@@ -1186,7 +1449,7 @@ mod tests {
         let (app, state, _file) = app().await;
         let session = state
             .store
-            .create_session(None)
+            .create_session(None, None)
             .await
             .expect("session creates");
         state
@@ -1229,7 +1492,7 @@ mod tests {
         let (app, state, _file) = app().await;
         let session = state
             .store
-            .create_session(None)
+            .create_session(None, None)
             .await
             .expect("session creates");
         let response = app

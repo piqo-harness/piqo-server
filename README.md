@@ -148,6 +148,22 @@ cargo run -p piqo-cli -- run \
 The CLI creates a session, queues the run, follows its event stream, and prints
 assistant text. Add `--json` to print every event as newline-delimited JSON.
 
+Create a project first to group its sessions in a TUI or desktop client, then
+pass it when creating a new run:
+
+```sh
+cargo run -p piqo-cli -- project create --name piqo --path "$PWD"
+cargo run -p piqo-cli -- run --project <project-id> --provider local --model Qwen/Qwen3-8B "Summarize this repository."
+```
+
+Use `piqo project list`, `get`, or `update` to manage groups. Project deletion
+cascades to all of its sessions and event history, so the CLI requires an
+explicit confirmation:
+
+```sh
+cargo run -p piqo-cli -- project delete <project-id> --yes
+```
+
 To continue an existing session:
 
 ```sh
@@ -389,7 +405,11 @@ curl -N \
 | --- | --- | --- |
 | `GET` | `/api/v1/health` | Health check |
 | `GET` | `/api/v1/openapi.json` | OpenAPI document |
+| `POST`, `GET` | `/api/v1/projects` | Create or list project groups |
+| `GET`, `PATCH`, `DELETE` | `/api/v1/projects/{id}` | Inspect, update, or delete a project and its sessions |
+| `GET` | `/api/v1/projects/{id}/sessions` | Paginated sessions for one project |
 | `POST`, `GET` | `/api/v1/sessions` | Create or list sessions |
+| `GET` | `/api/v1/sessions?unassigned=true` | Sessions not attached to a project |
 | `GET` | `/api/v1/sessions/{id}` | Session summary and projection |
 | `GET` | `/api/v1/sessions/{id}/events` | Paginated event history |
 | `GET` | `/api/v1/sessions/{id}/events/stream` | Replayable SSE stream |
