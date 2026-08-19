@@ -264,6 +264,7 @@ base_url = "http://127.0.0.1:8000/v1"
 protocol = "chat_completions" # or "responses"
 connect_timeout_seconds = 10
 api_key_env = "OPTIONAL_API_KEY_VARIABLE"
+models = ["Qwen/Qwen3-8B"] # optional manual catalog override
 
 [providers.local.headers]
 x-custom-header = "value"
@@ -279,10 +280,34 @@ Provider options:
 | `api_key_env` | Environment variable containing the bearer token |
 | `headers` | Additional HTTP headers |
 | `connect_timeout_seconds` | Connection timeout; defaults to 10 seconds |
+| `models` | Optional manual model catalog; when present, automatic discovery is disabled |
 
 `api_key` and `api_key_env` are mutually exclusive. piqo appends
 `/v1/chat/completions` or `/v1/responses` when the configured URL does not
 already contain the expected endpoint.
+
+When `models` is absent, piqo queries the OpenAI-compatible `/v1/models`
+endpoint after provider creation or updates and again during server startup.
+Discovery failures do not invalidate the provider; the API reports the failure
+and clients may retry it explicitly. A manual list is informational and does
+not prevent a run from naming another model.
+
+Providers can be managed without restarting the server through
+`/api/v1/providers`. Mutations are written atomically to `piqo.toml`, preserving
+comments and unrelated sections. Credential values and custom header values are
+write-only API fields: responses expose only the credential kind and header
+names. Prefer the `environment` credential form over storing a literal key:
+
+```json
+{
+  "name": "local",
+  "base_url": "http://127.0.0.1:8000/v1",
+  "credentials": {"type": "environment", "variable": "LOCAL_API_KEY"}
+}
+```
+
+The global `[models."model-id".body]` tables below remain request-body layers;
+they are separate from each provider's optional model catalog.
 
 Reload the complete file without restarting the process:
 
@@ -426,7 +451,10 @@ curl -N \
 | `GET` | `/api/v1/sessions/{id}/events` | Paginated event history |
 | `GET` | `/api/v1/sessions/{id}/events/stream` | Replayable SSE stream |
 | `POST` | `/api/v1/sessions/{id}/forks` | Fork at an event ID |
-| `GET` | `/api/v1/providers` | Configured provider catalog |
+| `GET`, `POST` | `/api/v1/providers` | List or create providers |
+| `GET`, `PATCH`, `DELETE` | `/api/v1/providers/{provider}` | Inspect, update, or immediately delete a provider |
+| `GET`, `PUT`, `DELETE` | `/api/v1/providers/{provider}/models` | Read, replace, or clear the manual model catalog |
+| `POST` | `/api/v1/providers/{provider}/models/refresh` | Refresh automatic discovery when no manual override exists |
 | `POST` | `/api/v1/config/reload` | Atomically reload `piqo.toml` |
 | `POST` | `/api/v1/sessions/{id}/runs` | Queue a run |
 | `GET` | `/api/v1/sessions/{id}/runs/{run_id}` | Inspect a run |

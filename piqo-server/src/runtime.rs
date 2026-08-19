@@ -4,7 +4,6 @@ use std::{
     io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
     time::Duration,
 };
 
@@ -15,8 +14,8 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    router_with_token, AppState, BindAddressError, ConfigError, ConfigManager, PiqoConfig,
-    SqliteStore, StoreError,
+    router_with_token, AppState, BindAddressError, ConfigError, ConfigManager, SqliteStore,
+    StoreError,
 };
 
 #[derive(Debug, Clone)]
@@ -110,6 +109,7 @@ pub struct PreparedServer {
     state: AppState,
     shutdown: CancellationToken,
     shutdown_timeout: Duration,
+    discovery_task: tokio::task::JoinHandle<()>,
     _instance_lock: Option<InstanceLock>,
 }
 
@@ -129,6 +129,7 @@ impl PreparedServer {
             state,
             shutdown,
             shutdown_timeout,
+            discovery_task,
             _instance_lock,
         } = self;
         let lifecycle = state.lifecycle();
@@ -143,6 +144,8 @@ impl PreparedServer {
         let mut cleanup = Box::pin(async move {
             cleanup_shutdown.cancelled().await;
             lifecycle.begin_shutdown();
+            discovery_task.abort();
+            let _ = discovery_task.await;
             let result = supervisor.shutdown(shutdown_timeout).await;
             lifecycle.close_streams();
             result
@@ -182,9 +185,7 @@ pub async fn prepare_server(options: ServerOptions) -> Result<PreparedServer, Se
         .as_deref()
         .map(InstanceLock::acquire)
         .transpose()?;
-    let config = PiqoConfig::load(&options.config)?;
-    config.validate()?;
-    let config = ConfigManager::new(options.config.clone(), Arc::new(config));
+    let config = ConfigManager::load(&options.config)?;
     let store = SqliteStore::connect(&options.database).await?;
     let recovered = store.recover_running_sessions().await?;
     if !recovered.is_empty() {
@@ -197,12 +198,15 @@ pub async fn prepare_server(options: ServerOptions) -> Result<PreparedServer, Se
         .await
         .map_err(ServerError::BindIo)?;
     let shutdown = CancellationToken::new();
-    let state = AppState::with_config_manager_and_dump_and_shutdown(
+    let state = AppState::with_config_and_dump_and_shutdown(
         store,
-        config,
+        config.clone(),
         options.dump_requests,
         shutdown.clone(),
     );
+    let discovery_task = tokio::spawn(async move {
+        config.discover_all().await;
+    });
     let router = router_with_token(state.clone(), options.auth_token);
     Ok(PreparedServer {
         listener,
@@ -210,6 +214,7 @@ pub async fn prepare_server(options: ServerOptions) -> Result<PreparedServer, Se
         state,
         shutdown,
         shutdown_timeout: options.shutdown_timeout,
+        discovery_task,
         _instance_lock,
     })
 }

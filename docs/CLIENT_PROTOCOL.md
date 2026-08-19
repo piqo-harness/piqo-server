@@ -286,7 +286,7 @@ Success is `201` with the new session summary. A fork is a new session; its ID
 MUST replace the parent ID for subsequent operations on that branch. A fork
 inherits its parent session's `project_id`.
 
-### 4.3 Provider catalog
+### 4.3 Providers and model catalogs
 
 `GET /api/v1/providers` returns:
 
@@ -295,16 +295,63 @@ inherits its parent session's `project_id`.
   "providers": [
     {
       "name": "local",
+      "base_url": "http://127.0.0.1:8000/v1",
       "protocol": "chat_completions",
+      "connect_timeout_seconds": 10,
+      "credentials": {"type": "environment", "variable": "LOCAL_API_KEY"},
+      "header_names": ["x-tenant"],
       "streaming": true,
       "non_streaming": true,
-      "models": ["model-id"]
+      "models": ["model-id"],
+      "model_source": "discovery",
+      "discovery": {
+        "status": "succeeded",
+        "last_attempt_at": "2026-08-19T12:00:00.000Z",
+        "error": null
+      }
     }
   ]
 }
 ```
 
-Provider and model identifiers are opaque, case-sensitive strings.
+Provider and model identifiers are opaque, case-sensitive strings. Provider
+identifiers are immutable URL-safe path segments. Model names may contain `/`
+because they are always transported in JSON rather than as path segments.
+
+Manage providers with:
+
+```text
+POST   /api/v1/providers
+GET    /api/v1/providers/{provider}
+PATCH  /api/v1/providers/{provider}
+DELETE /api/v1/providers/{provider}
+```
+
+Create and patch bodies accept `base_url`, `protocol`,
+`connect_timeout_seconds`, write-only `headers`, and an optional tagged
+`credentials` object: `{"type":"none"}`,
+`{"type":"api_key","value":"..."}`, or
+`{"type":"environment","variable":"..."}`. Responses never contain literal
+keys or header values. Deletion is immediate; queued or retried runs that have
+not resolved the provider may subsequently fail with `provider_not_found`.
+
+When no manual catalog is configured, piqo attempts `/v1/models` after provider
+creation and modification and during server startup. A failed discovery is
+reported through `discovery.status == "failed"` without rolling back the
+provider mutation. Model catalogs are informational and do not reject unknown
+model names in run requests.
+
+```text
+GET    /api/v1/providers/{provider}/models
+PUT    /api/v1/providers/{provider}/models
+DELETE /api/v1/providers/{provider}/models
+POST   /api/v1/providers/{provider}/models/refresh
+```
+
+`PUT` accepts `{"models":["model-id"]}` and replaces the complete manual
+catalog after trimming, validation, and stable deduplication. `DELETE` removes
+the override and immediately attempts discovery. Explicit refresh returns
+`409/manual_model_override` while a manual catalog is active.
 
 Reload the complete configuration from the path selected when the server
 started with an empty-body request:

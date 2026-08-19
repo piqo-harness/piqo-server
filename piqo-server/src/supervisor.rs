@@ -104,37 +104,14 @@ impl SessionSupervisor {
     #[cfg(test)]
     pub(crate) fn with_dump_dir(
         store: SqliteStore,
-        config: Arc<PiqoConfig>,
+        config: ConfigManager,
         hub: EventHub,
         dump_dir: Option<PathBuf>,
     ) -> Self {
-        Self::with_config_manager_and_shutdown(
-            store,
-            ConfigManager::new("piqo.toml", config),
-            hub,
-            dump_dir,
-            CancellationToken::new(),
-        )
+        Self::with_dump_dir_and_shutdown(store, config, hub, dump_dir, CancellationToken::new())
     }
 
-    #[cfg(test)]
     pub(crate) fn with_dump_dir_and_shutdown(
-        store: SqliteStore,
-        config: Arc<PiqoConfig>,
-        hub: EventHub,
-        dump_dir: Option<PathBuf>,
-        shutdown: CancellationToken,
-    ) -> Self {
-        Self::with_config_manager_and_shutdown(
-            store,
-            ConfigManager::new("piqo.toml", config),
-            hub,
-            dump_dir,
-            shutdown,
-        )
-    }
-
-    pub(crate) fn with_config_manager_and_shutdown(
         store: SqliteStore,
         config: ConfigManager,
         hub: EventHub,
@@ -233,9 +210,6 @@ impl SessionSupervisor {
             ));
         }
         self.config
-            .snapshot()
-            .await
-            .config
             .resolve_provider(&request.provider)
             .map_err(|error| match error {
                 crate::config::ConfigError::ProviderNotFound(name) => {
@@ -549,7 +523,10 @@ impl SessionSupervisor {
             Err(error) => return ExecutionResult::Failed(error.to_string(), false),
         };
         let initial_config = if execution.is_none() {
-            let config = self.config.snapshot().await.config;
+            let config = match self.config.snapshot() {
+                Ok(config) => config,
+                Err(error) => return ExecutionResult::Failed(error.to_string(), false),
+            };
             let provider = match config.resolve_provider(&request.provider) {
                 Ok(provider) => provider,
                 Err(error) => return ExecutionResult::Failed(error.to_string(), false),
@@ -1327,13 +1304,14 @@ fn build_body(
     request: &RunRequest,
     projection: &piqo_core::SessionProjection,
 ) -> Result<Value, StoreError> {
-    let mut body = merge_request_bodies(config.body_layers(
+    let layers = config.body_layers(
         &request.model,
         request.agent.as_deref(),
         request.variant.as_deref(),
         request.body.clone(),
-    ))
-    .map_err(|error| StoreError::InvalidRequest(error.to_string()))?;
+    );
+    let mut body = merge_request_bodies(layers)
+        .map_err(|error| StoreError::InvalidRequest(error.to_string()))?;
     let object = body
         .as_object_mut()
         .ok_or_else(|| StoreError::InvalidRequest("request body must be an object".into()))?;
@@ -1420,6 +1398,7 @@ fn find_sse_frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PiqoConfig;
     use serde_json::json;
     use tempfile::{tempdir, NamedTempFile};
     use tokio::{net::TcpListener, sync::oneshot};
@@ -1502,8 +1481,8 @@ mod tests {
             "[providers.local]\nbase_url = \"http://{old_address}\"\n"
         ))
         .expect("initial config parses");
-        let manager = ConfigManager::new(&config_path, Arc::new(initial));
-        let supervisor = SessionSupervisor::with_config_manager_and_shutdown(
+        let manager = ConfigManager::file(&config_path, initial);
+        let supervisor = SessionSupervisor::with_dump_dir_and_shutdown(
             store.clone(),
             manager.clone(),
             EventHub::new(),
@@ -1578,8 +1557,8 @@ mod tests {
             "[providers.local]\nbase_url = \"http://{old_address}\"\n"
         ))
         .expect("initial config parses");
-        let manager = ConfigManager::new(&config_path, Arc::new(initial));
-        let supervisor = SessionSupervisor::with_config_manager_and_shutdown(
+        let manager = ConfigManager::file(&config_path, initial);
+        let supervisor = SessionSupervisor::with_dump_dir_and_shutdown(
             store.clone(),
             manager.clone(),
             EventHub::new(),
@@ -1659,7 +1638,7 @@ mod tests {
         let hub = EventHub::new();
         let supervisor = SessionSupervisor::with_dump_dir_and_shutdown(
             store.clone(),
-            Arc::new(config),
+            ConfigManager::memory(config),
             hub,
             None,
             CancellationToken::new(),
@@ -1771,7 +1750,7 @@ mod tests {
             .expect("events append");
         let supervisor = SessionSupervisor::with_dump_dir(
             store.clone(),
-            Arc::new(PiqoConfig::default()),
+            ConfigManager::memory(PiqoConfig::default()),
             EventHub::new(),
             None,
         );
@@ -1825,7 +1804,7 @@ mod tests {
         let mut stream = hub.subscribe(&session.id).await;
         let supervisor = SessionSupervisor::with_dump_dir_and_shutdown(
             store.clone(),
-            Arc::new(config),
+            ConfigManager::memory(config),
             hub,
             None,
             CancellationToken::new(),
