@@ -18,7 +18,11 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::{config::PiqoConfig, storage::StoreError, SqliteStore};
+use crate::{
+    config::{ConfigManager, PiqoConfig, ResolvedProvider},
+    storage::StoreError,
+    SqliteStore,
+};
 
 #[derive(Clone)]
 pub(crate) struct EventHub {
@@ -85,7 +89,7 @@ pub struct RunRequest {
 #[derive(Clone)]
 pub struct SessionSupervisor {
     store: SqliteStore,
-    config: Arc<PiqoConfig>,
+    config: ConfigManager,
     transport: ProviderTransport,
     hub: EventHub,
     locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
@@ -97,18 +101,42 @@ pub struct SessionSupervisor {
 }
 
 impl SessionSupervisor {
+    #[cfg(test)]
     pub(crate) fn with_dump_dir(
         store: SqliteStore,
         config: Arc<PiqoConfig>,
         hub: EventHub,
         dump_dir: Option<PathBuf>,
     ) -> Self {
-        Self::with_dump_dir_and_shutdown(store, config, hub, dump_dir, CancellationToken::new())
+        Self::with_config_manager_and_shutdown(
+            store,
+            ConfigManager::new("piqo.toml", config),
+            hub,
+            dump_dir,
+            CancellationToken::new(),
+        )
     }
 
+    #[cfg(test)]
     pub(crate) fn with_dump_dir_and_shutdown(
         store: SqliteStore,
         config: Arc<PiqoConfig>,
+        hub: EventHub,
+        dump_dir: Option<PathBuf>,
+        shutdown: CancellationToken,
+    ) -> Self {
+        Self::with_config_manager_and_shutdown(
+            store,
+            ConfigManager::new("piqo.toml", config),
+            hub,
+            dump_dir,
+            shutdown,
+        )
+    }
+
+    pub(crate) fn with_config_manager_and_shutdown(
+        store: SqliteStore,
+        config: ConfigManager,
         hub: EventHub,
         dump_dir: Option<PathBuf>,
         shutdown: CancellationToken,
@@ -205,6 +233,9 @@ impl SessionSupervisor {
             ));
         }
         self.config
+            .snapshot()
+            .await
+            .config
             .resolve_provider(&request.provider)
             .map_err(|error| match error {
                 crate::config::ConfigError::ProviderNotFound(name) => {
@@ -480,7 +511,9 @@ impl SessionSupervisor {
                 }
                 run.attempt_id = Some(attempt_id);
                 run.attempts += 1;
-                let result = self.execute_run(session_id, &run, token, None, 0).await;
+                let result = self
+                    .execute_run(session_id, &run, token, None, None, 0)
+                    .await;
                 self.cancellations.lock().await.remove(&run.run_id);
                 self.finish_run(session_id, &run, result).await?;
             }
@@ -507,6 +540,7 @@ impl SessionSupervisor {
         session_id: &str,
         run: &RunProjection,
         cancellation: CancellationToken,
+        execution: Option<Arc<RunExecutionConfig>>,
         existing_assistant_message: Option<String>,
         retry_count: u8,
     ) -> ExecutionResult {
@@ -514,9 +548,15 @@ impl SessionSupervisor {
             Ok(request) => request,
             Err(error) => return ExecutionResult::Failed(error.to_string(), false),
         };
-        let provider = match self.config.resolve_provider(&request.provider) {
-            Ok(provider) => provider,
-            Err(error) => return ExecutionResult::Failed(error.to_string(), false),
+        let initial_config = if execution.is_none() {
+            let config = self.config.snapshot().await.config;
+            let provider = match config.resolve_provider(&request.provider) {
+                Ok(provider) => provider,
+                Err(error) => return ExecutionResult::Failed(error.to_string(), false),
+            };
+            Some((config, provider))
+        } else {
+            None
         };
         let mut attempt_id = if retry_count == 0 {
             run.attempt_id
@@ -584,18 +624,27 @@ impl SessionSupervisor {
                 return ExecutionResult::Failed(error.to_string(), false);
             }
         }
-        let projection = match self.store.projection(session_id).await {
-            Ok(projection) => projection,
-            Err(error) => return ExecutionResult::Failed(error.to_string(), false),
+        let execution = match (execution, initial_config) {
+            (Some(execution), None) => execution,
+            (None, Some((config, provider))) => {
+                let projection = match self.store.projection(session_id).await {
+                    Ok(projection) => projection,
+                    Err(error) => return ExecutionResult::Failed(error.to_string(), false),
+                };
+                let body = match build_body(&config, &provider.protocol, &request, &projection) {
+                    Ok(body) => body,
+                    Err(error) => return ExecutionResult::Failed(error.to_string(), false),
+                };
+                Arc::new(RunExecutionConfig { provider, body })
+            }
+            _ => return ExecutionResult::Failed("invalid execution snapshot".to_owned(), false),
         };
-        let body = match build_body(&self.config, &provider.protocol, &request, &projection) {
-            Ok(body) => body,
-            Err(error) => return ExecutionResult::Failed(error.to_string(), false),
-        };
+        let provider = &execution.provider;
+        let body = &execution.body;
         let is_existing_assistant = existing_assistant_message.is_some();
         let assistant_message_id =
             existing_assistant_message.unwrap_or_else(|| Uuid::now_v7().to_string());
-        if run.retry_of.is_none() || !is_existing_assistant {
+        if !is_existing_assistant {
             if let Err(error) = self
                 .append(
                     session_id,
@@ -626,8 +675,8 @@ impl SessionSupervisor {
                     directory,
                     &run.run_id,
                     retries.saturating_add(1),
-                    &provider,
-                    &body,
+                    provider,
+                    body,
                 )
                 .await
                 {
@@ -691,7 +740,7 @@ impl SessionSupervisor {
                 false,
             );
         }
-        let stream_mode = body_stream_mode(&body);
+        let stream_mode = body_stream_mode(body);
         let mut saw_delta = false;
         let mut usage = None;
         let mut text_buffer = String::new();
@@ -989,6 +1038,7 @@ impl SessionSupervisor {
                     session_id,
                     run,
                     cancellation,
+                    Some(execution),
                     Some(assistant_message_id),
                     retry_count + 1,
                 ))
@@ -1254,6 +1304,11 @@ enum ExecutionResult {
     RequiresAction,
 }
 
+struct RunExecutionConfig {
+    provider: ResolvedProvider,
+    body: Value,
+}
+
 struct ToolCallBuffer {
     call_id: Option<String>,
     name: Option<String>,
@@ -1366,8 +1421,222 @@ fn find_sse_frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use tempfile::NamedTempFile;
-    use tokio::net::TcpListener;
+    use tempfile::{tempdir, NamedTempFile};
+    use tokio::{net::TcpListener, sync::oneshot};
+
+    async fn send_raw_response(stream: tokio::net::TcpStream, response: &str) {
+        let mut remaining = response.as_bytes();
+        while !remaining.is_empty() {
+            stream.writable().await.expect("provider socket writable");
+            match stream.try_write(remaining) {
+                Ok(written) => remaining = &remaining[written..],
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("provider response writes: {error}"),
+            }
+        }
+    }
+
+    async fn send_http_response(stream: tokio::net::TcpStream, body: &str, length: usize) {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {length}\r\nconnection: close\r\n\r\n{body}"
+        );
+        send_raw_response(stream, &response).await;
+    }
+
+    fn completed_sse() -> String {
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_owned()
+    }
+
+    async fn wait_for_run_status(
+        store: &SqliteStore,
+        session_id: &str,
+        run_id: &str,
+        status: RunStatus,
+    ) {
+        let result = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let projection = store
+                    .projection(session_id)
+                    .await
+                    .expect("projection loads");
+                if projection.runs[run_id].status == status {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if result.is_err() {
+            let projection = store
+                .projection(session_id)
+                .await
+                .expect("projection loads after timeout");
+            panic!(
+                "run did not reach {status:?}: {:?}",
+                projection.runs[run_id]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_run_uses_the_latest_config_when_execution_starts() {
+        let database = NamedTempFile::new().expect("temporary sqlite file");
+        let store = SqliteStore::connect_file(database.path())
+            .await
+            .expect("store opens");
+        let old_provider = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("old provider binds");
+        let old_address = old_provider.local_addr().expect("old provider address");
+        let new_provider = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("new provider binds");
+        let new_address = new_provider.local_addr().expect("new provider address");
+        let directory = tempdir().expect("config directory creates");
+        let config_path = directory.path().join("piqo.toml");
+        let initial: PiqoConfig = toml::from_str(&format!(
+            "[providers.local]\nbase_url = \"http://{old_address}\"\n"
+        ))
+        .expect("initial config parses");
+        let manager = ConfigManager::new(&config_path, Arc::new(initial));
+        let supervisor = SessionSupervisor::with_config_manager_and_shutdown(
+            store.clone(),
+            manager.clone(),
+            EventHub::new(),
+            None,
+            CancellationToken::new(),
+        );
+        let session = store
+            .create_session(None, None)
+            .await
+            .expect("session creates");
+        let session_lock = Arc::new(Mutex::new(()));
+        let guard = session_lock.lock().await;
+        supervisor
+            .locks
+            .lock()
+            .await
+            .insert(session.id.clone(), session_lock.clone());
+        let run_id = supervisor
+            .queue_run(
+                &session.id,
+                RunRequest {
+                    provider: "local".into(),
+                    model: "test-model".into(),
+                    input: json!("hello"),
+                    agent: None,
+                    variant: None,
+                    body: json!({}),
+                },
+            )
+            .await
+            .expect("run queues");
+
+        std::fs::write(
+            &config_path,
+            format!("[providers.local]\nbase_url = \"http://{new_address}\"\n"),
+        )
+        .expect("new config writes");
+        manager.reload().await.expect("config reloads");
+        let provider_task = tokio::spawn(async move {
+            let (stream, _) = new_provider.accept().await.expect("new provider accepts");
+            let body = completed_sse();
+            send_http_response(stream, &body, body.len()).await;
+        });
+        drop(guard);
+
+        wait_for_run_status(&store, &session.id, &run_id, RunStatus::Completed).await;
+        provider_task.await.expect("new provider task joins");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), old_provider.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn active_run_retries_with_its_original_config_snapshot() {
+        let database = NamedTempFile::new().expect("temporary sqlite file");
+        let store = SqliteStore::connect_file(database.path())
+            .await
+            .expect("store opens");
+        let old_provider = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("old provider binds");
+        let old_address = old_provider.local_addr().expect("old provider address");
+        let new_provider = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("new provider binds");
+        let new_address = new_provider.local_addr().expect("new provider address");
+        let directory = tempdir().expect("config directory creates");
+        let config_path = directory.path().join("piqo.toml");
+        let initial: PiqoConfig = toml::from_str(&format!(
+            "[providers.local]\nbase_url = \"http://{old_address}\"\n"
+        ))
+        .expect("initial config parses");
+        let manager = ConfigManager::new(&config_path, Arc::new(initial));
+        let supervisor = SessionSupervisor::with_config_manager_and_shutdown(
+            store.clone(),
+            manager.clone(),
+            EventHub::new(),
+            None,
+            CancellationToken::new(),
+        );
+        let (first_response_sent, first_response_received) = oneshot::channel();
+        let provider_task = tokio::spawn(async move {
+            let (stream, _) = old_provider.accept().await.expect("first request accepts");
+            send_raw_response(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n20\r\ndata: {}\n\n",
+            )
+            .await;
+            first_response_sent
+                .send(())
+                .expect("test receives first response signal");
+            let (stream, _) = old_provider.accept().await.expect("retry accepts");
+            let body = completed_sse();
+            send_http_response(stream, &body, body.len()).await;
+        });
+        let session = store
+            .create_session(None, None)
+            .await
+            .expect("session creates");
+        let run_id = supervisor
+            .queue_run(
+                &session.id,
+                RunRequest {
+                    provider: "local".into(),
+                    model: "test-model".into(),
+                    input: json!("hello"),
+                    agent: None,
+                    variant: None,
+                    body: json!({}),
+                },
+            )
+            .await
+            .expect("run queues");
+        first_response_received
+            .await
+            .expect("first response is sent");
+        std::fs::write(
+            &config_path,
+            format!("[providers.local]\nbase_url = \"http://{new_address}\"\n"),
+        )
+        .expect("new config writes");
+        manager.reload().await.expect("config reloads");
+
+        wait_for_run_status(&store, &session.id, &run_id, RunStatus::Completed).await;
+        provider_task.await.expect("old provider task joins");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), new_provider.accept())
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn shutdown_interrupts_an_active_provider_run_and_persists_the_reason() {

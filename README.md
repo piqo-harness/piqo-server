@@ -284,6 +284,18 @@ Provider options:
 `/v1/chat/completions` or `/v1/responses` when the configured URL does not
 already contain the expected endpoint.
 
+Reload the complete file without restarting the process:
+
+```sh
+curl -X POST http://127.0.0.1:8080/api/v1/config/reload
+```
+
+The replacement is atomic. Active runs keep the configuration captured when
+they started, while queued runs use the latest configuration when execution
+begins. An invalid or missing file returns `422/config_invalid`, then causes a
+graceful shutdown with a non-zero process exit so the host can surface the
+configuration error.
+
 ### Request-body layers
 
 Request bodies are shallow-merged in this order, with later layers winning:
@@ -415,6 +427,7 @@ curl -N \
 | `GET` | `/api/v1/sessions/{id}/events/stream` | Replayable SSE stream |
 | `POST` | `/api/v1/sessions/{id}/forks` | Fork at an event ID |
 | `GET` | `/api/v1/providers` | Configured provider catalog |
+| `POST` | `/api/v1/config/reload` | Atomically reload `piqo.toml` |
 | `POST` | `/api/v1/sessions/{id}/runs` | Queue a run |
 | `GET` | `/api/v1/sessions/{id}/runs/{run_id}` | Inspect a run |
 | `POST` | `/api/v1/sessions/{id}/runs/{run_id}/cancel` | Cancel a run |

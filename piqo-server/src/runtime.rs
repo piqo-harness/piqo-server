@@ -15,7 +15,8 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    router_with_token, AppState, BindAddressError, ConfigError, PiqoConfig, SqliteStore, StoreError,
+    router_with_token, AppState, BindAddressError, ConfigError, ConfigManager, PiqoConfig,
+    SqliteStore, StoreError,
 };
 
 #[derive(Debug, Clone)]
@@ -45,6 +46,8 @@ pub enum ServerError {
     InstanceLocked(PathBuf),
     #[error("server shutdown timed out")]
     ShutdownTimeout,
+    #[error("configuration reload failed: {0}")]
+    ConfigReload(String),
 }
 
 impl ServerError {
@@ -56,6 +59,7 @@ impl ServerError {
             Self::Bind(_) | Self::BindIo(_) => "bind_failed",
             Self::Io(_) => "storage_unavailable",
             Self::ShutdownTimeout => "storage_unavailable",
+            Self::ConfigReload(_) => "config_invalid",
         }
     }
 }
@@ -156,6 +160,9 @@ impl PreparedServer {
                 server.await.map_err(ServerError::Io)?;
             }
         }
+        if let Some(message) = state.take_fatal_reload_error().await {
+            return Err(ServerError::ConfigReload(message));
+        }
         Ok(())
     }
 }
@@ -176,6 +183,8 @@ pub async fn prepare_server(options: ServerOptions) -> Result<PreparedServer, Se
         .map(InstanceLock::acquire)
         .transpose()?;
     let config = PiqoConfig::load(&options.config)?;
+    config.validate()?;
+    let config = ConfigManager::new(options.config.clone(), Arc::new(config));
     let store = SqliteStore::connect(&options.database).await?;
     let recovered = store.recover_running_sessions().await?;
     if !recovered.is_empty() {
@@ -188,9 +197,9 @@ pub async fn prepare_server(options: ServerOptions) -> Result<PreparedServer, Se
         .await
         .map_err(ServerError::BindIo)?;
     let shutdown = CancellationToken::new();
-    let state = AppState::with_config_and_dump_and_shutdown(
+    let state = AppState::with_config_manager_and_dump_and_shutdown(
         store,
-        Arc::new(config),
+        config,
         options.dump_requests,
         shutdown.clone(),
     );
@@ -203,4 +212,47 @@ pub async fn prepare_server(options: ServerOptions) -> Result<PreparedServer, Se
         shutdown_timeout: options.shutdown_timeout,
         _instance_lock,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::{tempdir, NamedTempFile};
+
+    #[tokio::test]
+    async fn invalid_reload_responds_then_stops_the_server_with_an_error() {
+        let directory = tempdir().expect("config directory creates");
+        let config_path = directory.path().join("piqo.toml");
+        std::fs::write(&config_path, "").expect("initial config writes");
+        let database = NamedTempFile::new().expect("temporary sqlite file");
+        let prepared = prepare_server(ServerOptions {
+            bind: "127.0.0.1:0".parse().expect("loopback address parses"),
+            database: format!("sqlite://{}", database.path().display()),
+            config: config_path.clone(),
+            dump_requests: None,
+            auth_token: None,
+            instance_lock: None,
+            shutdown_timeout: Duration::from_secs(2),
+        })
+        .await
+        .expect("server prepares");
+        let address = prepared.local_addr().expect("server address");
+        std::fs::write(&config_path, "invalid = [").expect("invalid config writes");
+
+        let server = tokio::spawn(prepared.run());
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/api/v1/config/reload"))
+            .send()
+            .await
+            .expect("reload request completes");
+        assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+        let body: serde_json::Value = response.json().await.expect("error body decodes");
+        assert_eq!(body["error"]["code"], "config_invalid");
+
+        let result = tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("server stops")
+            .expect("server task joins");
+        assert!(matches!(result, Err(ServerError::ConfigReload(_))));
+    }
 }
