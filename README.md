@@ -326,7 +326,7 @@ configuration error.
 Request bodies are shallow-merged in this order, with later layers winning:
 
 ```text
-defaults < model < agent < variant < individual request
+defaults < model < agent Markdown body < agent TOML body < variant < individual request
 ```
 
 Example:
@@ -353,6 +353,48 @@ enable_thinking = true
 Select named layers through the API's `agent` and `variant` fields. The current
 CLI exposes provider and model selection, but not agent, variant, or arbitrary
 request-body flags; use the HTTP API for those.
+
+### User-defined agents
+
+Piqo loads top-level `*.md` agent files from an `agents/` directory alongside
+`piqo.toml`; `agents/reviewer.md` defines the `reviewer` agent. Each file
+starts with YAML front-matter and continues with the agent's system prompt:
+
+```md
+---
+description: Review code without editing it
+provider: local
+model: Qwen/Qwen3-8B
+permissions:
+  read: allow
+  write: deny
+  bash: ask
+body:
+  temperature: 0.1
+---
+Review the supplied change for correctness, security, and missing tests.
+```
+
+`read`, `write`, and `bash` accept `allow`, `ask`, or `deny`. These
+settings are retained in the resolved configuration, but are not enforced until
+tool execution is connected to the server.
+
+`piqo.toml` can override any file-defined agent field without replacing its
+Markdown definition:
+
+```toml
+[agents.reviewer]
+model = "Qwen/Qwen3-14B"
+instructions = "Follow this repository's review checklist."
+
+[agents.reviewer.permissions]
+bash = "deny"
+```
+
+Explicit request `provider` and `model` values win. When an `agent`
+supplies them, HTTP clients may omit those fields. A raw request `body` that
+contains `messages` or `input` remains authoritative and bypasses automatic
+system-prompt and transcript construction.
 
 The merge is deliberately **shallow**. If two layers define the same key, the
 entire later value replaces the earlier one. Unknown keys such as `top_k` or
@@ -452,6 +494,7 @@ curl -N \
 | `GET` | `/api/v1/sessions/{id}/events/stream` | Replayable SSE stream |
 | `POST` | `/api/v1/sessions/{id}/forks` | Fork at an event ID |
 | `GET`, `POST` | `/api/v1/providers` | List or create providers |
+| `GET` | `/api/v1/agents` | List resolved user-defined agents without their prompts |
 | `GET`, `PATCH`, `DELETE` | `/api/v1/providers/{provider}` | Inspect, update, or immediately delete a provider |
 | `GET`, `PUT`, `DELETE` | `/api/v1/providers/{provider}/models` | Read, replace, or clear the manual model catalog |
 | `POST` | `/api/v1/providers/{provider}/models/refresh` | Refresh automatic discovery when no manual override exists |

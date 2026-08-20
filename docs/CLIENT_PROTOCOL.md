@@ -382,7 +382,34 @@ response as the reload result and then follow the normal process-exit recovery
 flow. A missing credential environment variable is not a structural reload
 error; it is reported when the affected provider is used.
 
-### 4.4 Queue a run
+### 4.4 Agents
+
+`GET /api/v1/agents` returns resolved agent metadata without exposing their
+instructions:
+
+```json
+{
+  "agents": [{
+    "id": "reviewer",
+    "description": "Review code without editing it",
+    "provider": "local",
+    "model": "model-id",
+    "permissions": {"read": "allow", "write": "deny", "bash": "ask"}
+  }]
+}
+```
+
+Agents load from top-level `<config-directory>/agents/*.md` files. Each file
+must use YAML front-matter delimited by `---`; its remaining content is the
+system prompt. Supported front-matter keys are `description`, `provider`,
+`model`, `permissions`, and provider-owned JSON `body`. Invalid
+front-matter makes the configuration invalid.
+
+`piqo.toml` entries under `[agents.<id>]` can override `description`,
+`provider`, `model`, `instructions`, individual `permissions`, and
+`body`. The Markdown body layer precedes the TOML body layer.
+
+### 4.5 Queue a run
 
 ```http
 POST /api/v1/sessions/{session_id}/runs
@@ -398,8 +425,10 @@ Content-Type: application/json
 }
 ```
 
-`provider`, `model`, and `input` are required. `agent` and `variant` may be
-`null`. `body` SHOULD be a JSON object and may contain arbitrary
+`input` is required. `provider` and `model` are required unless a selected
+`agent` supplies the missing value; explicit request values take precedence.
+`agent` and `variant` may be `null`. An unknown agent returns
+`400/agent_not_found`. `body` SHOULD be a JSON object and may contain arbitrary
 provider-specific fields. The client MUST preserve unknown body fields and
 MUST NOT normalize provider request bodies.
 

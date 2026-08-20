@@ -1319,7 +1319,7 @@ fn build_body(
         .entry("model")
         .or_insert_with(|| Value::String(request.model.clone()));
     object.entry("stream").or_insert(Value::Bool(true));
-    let transcript = projection
+    let mut transcript = projection
         .messages
         .iter()
         .filter(|message| message.completed || message.interrupted)
@@ -1344,6 +1344,16 @@ fn build_body(
             json!({"role": role_name(message.role), "content": content})
         })
         .collect::<Vec<_>>();
+    if let Some(instructions) = request
+        .agent
+        .as_deref()
+        .map(|name| config.agent(name))
+        .transpose()
+        .map_err(|error| StoreError::InvalidRequest(error.to_string()))?
+        .and_then(|agent| agent.instructions)
+    {
+        transcript.insert(0, json!({"role": "system", "content": instructions}));
+    }
     match protocol {
         ProviderProtocol::ChatCompletions => {
             object.entry("messages").or_insert(Value::Array(transcript));
@@ -1614,6 +1624,51 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(100), new_provider.accept())
                 .await
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn injects_agent_instructions_without_overriding_a_raw_transcript() {
+        let config: PiqoConfig = toml::from_str(
+            r#"
+                [agents.reviewer]
+                instructions = "Review carefully."
+            "#,
+        )
+        .expect("config parses");
+        let request = RunRequest {
+            provider: "local".to_owned(),
+            model: "model".to_owned(),
+            input: Value::Null,
+            agent: Some("reviewer".to_owned()),
+            variant: None,
+            body: Value::Null,
+        };
+        let projection = piqo_core::SessionProjection::new("session");
+        let body = build_body(
+            &config,
+            &ProviderProtocol::ChatCompletions,
+            &request,
+            &projection,
+        )
+        .expect("body builds");
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], "Review carefully.");
+
+        let request = RunRequest {
+            body: json!({"messages": [{"role": "user", "content": "raw"}]}),
+            ..request
+        };
+        let body = build_body(
+            &config,
+            &ProviderProtocol::ChatCompletions,
+            &request,
+            &projection,
+        )
+        .expect("body builds");
+        assert_eq!(
+            body["messages"],
+            json!([{"role": "user", "content": "raw"}])
         );
     }
 
