@@ -66,6 +66,8 @@ unauthenticated development mode.
 For the rationale and design constraints, see [ARCHITECTURE.md](ARCHITECTURE.md).
 Client implementers should follow the normative
 [client communication contract](docs/CLIENT_PROTOCOL.md).
+The work required to reach a complete local agent harness is organized in the
+[agent harness implementation roadmap](docs/AGENT_HARNESS_ROADMAP.md).
 
 ## Requirements
 
