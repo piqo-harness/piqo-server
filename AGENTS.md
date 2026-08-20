@@ -19,6 +19,18 @@ Consult these documents before changing their respective surfaces:
   principles.
 - `README.md` — current behaviour, configuration, CLI use, and sidecar packaging.
 - `docs/CLIENT_PROTOCOL.md` — normative client, HTTP, SSE, and sidecar contract.
+- `docs/AGENT_HARNESS_ROADMAP.md` — ordered milestone index, dependencies,
+  project-wide readiness/completion criteria, and planning-agent instructions.
+- `docs/milestones/` — scope, design decisions, implementation slices, required
+  tests, acceptance criteria, and exclusions for each planned milestone.
+
+Before planning or implementing milestone work, read
+`docs/AGENT_HARNESS_ROADMAP.md` and then the complete document for every
+milestone touched by the change. Inspect the current code before relying on a
+milestone's status, update the roadmap tracker when its state changes, and use
+the roadmap's required handoff format in the tracking issue or pull request.
+Milestone documents are planning contracts, not evidence that a capability is
+implemented.
 
 When code changes an externally visible behaviour, update the relevant contract
 and README material in the same change.
@@ -41,6 +53,8 @@ The Cargo workspace uses Rust 2021 and requires Rust 1.88 or newer.
 - `piqo-server/migrations/` — ordered, append-only SQLite migrations.
 - `piqo-server/tests/` — HTTP/OpenAPI/config and sidecar integration tests.
 - `docs/CLIENT_PROTOCOL.md` — API v1 and lifecycle protocol.
+- `docs/AGENT_HARNESS_ROADMAP.md` and `docs/milestones/` — implementation
+  roadmap and milestone-specific planning contracts.
 - `scripts/package-macos-arm64.sh` — macOS arm64 release archive build.
 
 Keep IO at the crate edges and preserve the dependency direction above. Put pure
