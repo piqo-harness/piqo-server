@@ -21,6 +21,7 @@ piqo-tools = { path = "../piqo-tools" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml = "0.9"
 toml.workspace = true
 toml_edit.workspace = true
 sqlx.workspace = true

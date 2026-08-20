@@ -27,15 +27,67 @@ pub struct PiqoConfig {
     #[serde(default)]
     pub models: HashMap<String, BodyLayer>,
     #[serde(default)]
-    pub agents: HashMap<String, BodyLayer>,
+    pub agents: HashMap<String, AgentConfigOverride>,
     #[serde(default)]
     pub variants: HashMap<String, BodyLayer>,
+    #[serde(skip)]
+    markdown_agents: HashMap<String, AgentDefinition>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct BodyLayer {
     #[serde(default)]
     pub body: Value,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AgentConfigOverride {
+    pub description: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub instructions: Option<String>,
+    pub permissions: Option<AgentPermissions>,
+    #[serde(default)]
+    pub body: Value,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPermissions {
+    pub read: Option<PermissionSetting>,
+    pub write: Option<PermissionSetting>,
+    pub bash: Option<PermissionSetting>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionSetting {
+    Allow,
+    Ask,
+    Deny,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AgentDefinition {
+    pub id: String,
+    pub description: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub instructions: Option<String>,
+    pub permissions: AgentPermissions,
+    markdown_body: Value,
+    toml_body: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentFrontMatter {
+    description: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    permissions: Option<AgentPermissions>,
+    #[serde(default)]
+    body: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -177,6 +229,15 @@ pub enum ConfigError {
     },
     #[error("failed to parse TOML configuration: {0}")]
     Parse(#[from] toml::de::Error),
+    #[error("failed to read agent definition {path}: {source}")]
+    AgentRead {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("invalid agent definition {path}: {reason}")]
+    InvalidAgentDefinition { path: String, reason: String },
+    #[error("agent {0} is not configured")]
+    AgentNotFound(String),
     #[error("failed to edit TOML configuration: {0}")]
     Edit(#[from] toml_edit::TomlError),
     #[error("provider {0} is not configured")]
@@ -228,14 +289,16 @@ pub struct ConfigManager {
 impl PiqoConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path_ref = path.as_ref();
-        if !path_ref.exists() {
-            return Ok(Self::default());
-        }
-        let text = fs::read_to_string(path_ref).map_err(|source| ConfigError::Read {
-            path: path_ref.display().to_string(),
-            source,
-        })?;
-        let config: Self = toml::from_str(&text)?;
+        let mut config = if path_ref.exists() {
+            let text = fs::read_to_string(path_ref).map_err(|source| ConfigError::Read {
+                path: path_ref.display().to_string(),
+                source,
+            })?;
+            toml::from_str(&text)?
+        } else {
+            Self::default()
+        };
+        config.load_markdown_agents(path_ref)?;
         config.validate()?;
         Ok(config)
     }
@@ -246,6 +309,132 @@ impl PiqoConfig {
             provider.validate(name)?;
         }
         Ok(())
+    }
+
+    fn load_markdown_agents(&mut self, config_path: &Path) -> Result<(), ConfigError> {
+        let directory = config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("agents");
+        if !directory.exists() {
+            return Ok(());
+        }
+        let entries = fs::read_dir(&directory).map_err(|source| ConfigError::AgentRead {
+            path: directory.display().to_string(),
+            source,
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|source| ConfigError::AgentRead {
+                path: directory.display().to_string(),
+                source,
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("md") {
+                continue;
+            }
+            if !entry
+                .file_type()
+                .map_err(|source| ConfigError::AgentRead {
+                    path: path.display().to_string(),
+                    source,
+                })?
+                .is_file()
+            {
+                continue;
+            }
+            let id = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .ok_or_else(|| ConfigError::InvalidAgentDefinition {
+                    path: path.display().to_string(),
+                    reason: "file name must be valid UTF-8".to_owned(),
+                })?;
+            if !valid_agent_id(id) {
+                return Err(ConfigError::InvalidAgentDefinition {
+                    path: path.display().to_string(),
+                    reason: "file name must use letters, digits, underscores, or hyphens"
+                        .to_owned(),
+                });
+            }
+            let text = fs::read_to_string(&path).map_err(|source| ConfigError::AgentRead {
+                path: path.display().to_string(),
+                source,
+            })?;
+            let (front_matter, instructions) = split_front_matter(&text).map_err(|reason| {
+                ConfigError::InvalidAgentDefinition {
+                    path: path.display().to_string(),
+                    reason,
+                }
+            })?;
+            let front_matter: AgentFrontMatter =
+                serde_yaml::from_str(front_matter).map_err(|error| {
+                    ConfigError::InvalidAgentDefinition {
+                        path: path.display().to_string(),
+                        reason: error.to_string(),
+                    }
+                })?;
+            let definition = AgentDefinition {
+                id: id.to_owned(),
+                description: front_matter.description,
+                provider: front_matter.provider,
+                model: front_matter.model,
+                instructions: (!instructions.trim().is_empty()).then(|| instructions.to_owned()),
+                permissions: front_matter.permissions.unwrap_or_default(),
+                markdown_body: front_matter.body,
+                toml_body: Value::Null,
+            };
+            if self
+                .markdown_agents
+                .insert(id.to_owned(), definition)
+                .is_some()
+            {
+                return Err(ConfigError::InvalidAgentDefinition {
+                    path: path.display().to_string(),
+                    reason: format!("duplicate agent {id}"),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn agent(&self, name: &str) -> Result<AgentDefinition, ConfigError> {
+        let mut agent =
+            self.markdown_agents
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| AgentDefinition {
+                    id: name.to_owned(),
+                    ..AgentDefinition::default()
+                });
+        match self.agents.get(name) {
+            Some(override_config) => {
+                agent.description = override_config.description.clone().or(agent.description);
+                agent.provider = override_config.provider.clone().or(agent.provider);
+                agent.model = override_config.model.clone().or(agent.model);
+                agent.instructions = override_config.instructions.clone().or(agent.instructions);
+                merge_permissions(&mut agent.permissions, override_config.permissions.as_ref());
+                agent.toml_body = override_config.body.clone();
+            }
+            None if !self.markdown_agents.contains_key(name) => {
+                return Err(ConfigError::AgentNotFound(name.to_owned()));
+            }
+            None => {}
+        }
+        Ok(agent)
+    }
+
+    pub fn agents(&self) -> Vec<AgentDefinition> {
+        let mut names: Vec<_> = self
+            .markdown_agents
+            .keys()
+            .chain(self.agents.keys())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+            .into_iter()
+            .filter_map(|name| self.agent(name).ok())
+            .collect()
     }
 
     pub fn resolve_provider(&self, name: &str) -> Result<ResolvedProvider, ConfigError> {
@@ -268,8 +457,13 @@ impl PiqoConfig {
             layers.push(normalize_body(&layer.body));
         }
         if let Some(name) = agent {
-            if let Some(layer) = self.agents.get(name) {
-                layers.push(normalize_body(&layer.body));
+            if let Ok(agent) = self.agent(name) {
+                if self.markdown_agents.contains_key(name) {
+                    layers.push(normalize_body(&agent.markdown_body));
+                }
+                if self.agents.contains_key(name) {
+                    layers.push(normalize_body(&agent.toml_body));
+                }
             }
         }
         if let Some(name) = variant {
@@ -280,6 +474,43 @@ impl PiqoConfig {
         layers.push(normalize_body(&request));
         layers
     }
+}
+
+fn merge_permissions(
+    target: &mut AgentPermissions,
+    override_permissions: Option<&AgentPermissions>,
+) {
+    let Some(override_permissions) = override_permissions else {
+        return;
+    };
+    target.read = override_permissions.read.or(target.read);
+    target.write = override_permissions.write.or(target.write);
+    target.bash = override_permissions.bash.or(target.bash);
+}
+
+fn valid_agent_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn split_front_matter(text: &str) -> Result<(&str, &str), String> {
+    let opening_end = text
+        .find('\n')
+        .ok_or_else(|| "front matter must start with a --- delimiter".to_owned())?;
+    if text[..opening_end].trim_end_matches('\r') != "---" {
+        return Err("front matter must start with a --- delimiter".to_owned());
+    }
+    let remaining = &text[opening_end + 1..];
+    let mut offset = 0;
+    for line in remaining.split_inclusive('\n') {
+        if line.trim_end_matches(['\r', '\n']) == "---" {
+            return Ok((&remaining[..offset], &remaining[offset + line.len()..]));
+        }
+        offset += line.len();
+    }
+    Err("front matter must end with a --- delimiter".to_owned())
 }
 
 impl ProviderConfig {
@@ -431,12 +662,7 @@ impl ConfigManager {
                 .mutation
                 .lock()
                 .map_err(|_| ConfigError::LockPoisoned)?;
-            let text = fs::read_to_string(&path).map_err(|source| ConfigError::Read {
-                path: path.display().to_string(),
-                source,
-            })?;
-            let config: PiqoConfig = toml::from_str(&text)?;
-            config.validate()?;
+            let config = PiqoConfig::load(&path)?;
             let mut current = inner
                 .config
                 .write()
@@ -474,6 +700,14 @@ impl ConfigManager {
         request: Value,
     ) -> Result<Vec<Value>, ConfigError> {
         Ok(self.snapshot()?.body_layers(model, agent, variant, request))
+    }
+
+    pub fn agent(&self, name: &str) -> Result<AgentDefinition, ConfigError> {
+        self.snapshot()?.agent(name)
+    }
+
+    pub fn agents(&self) -> Result<Vec<AgentDefinition>, ConfigError> {
+        Ok(self.snapshot()?.agents())
     }
 
     pub fn catalog(&self) -> Result<Vec<ProviderCatalogEntry>, ConfigError> {
@@ -1096,6 +1330,78 @@ mod tests {
         assert_eq!(layers.len(), 5);
         assert_eq!(layers[0]["temperature"], 0.2);
         assert_eq!(layers[3]["temperature"], 0.8);
+    }
+
+    #[test]
+    fn loads_markdown_agents_and_applies_toml_overrides() {
+        let directory = tempdir().expect("temporary directory");
+        let agents = directory.path().join("agents");
+        fs::create_dir(&agents).expect("agent directory creates");
+        fs::write(
+            agents.join("reviewer.md"),
+            r#"---
+description: Review code without edits
+provider: local
+model: reviewer-model
+permissions:
+  read: allow
+  write: deny
+body:
+  temperature: 0.1
+---
+Focus on correctness.
+"#,
+        )
+        .expect("agent fixture writes");
+        let path = directory.path().join("piqo.toml");
+        fs::write(
+            &path,
+            r#"[agents.reviewer]
+model = "override-model"
+instructions = "Use the repository conventions."
+[agents.reviewer.permissions]
+bash = "ask"
+[agents.reviewer.body]
+temperature = 0.2
+"#,
+        )
+        .expect("config fixture writes");
+
+        let config = PiqoConfig::load(&path).expect("config loads");
+        let agent = config.agent("reviewer").expect("agent resolves");
+        assert_eq!(
+            agent.description.as_deref(),
+            Some("Review code without edits")
+        );
+        assert_eq!(agent.provider.as_deref(), Some("local"));
+        assert_eq!(agent.model.as_deref(), Some("override-model"));
+        assert_eq!(
+            agent.instructions.as_deref(),
+            Some("Use the repository conventions.")
+        );
+        assert_eq!(agent.permissions.read, Some(PermissionSetting::Allow));
+        assert_eq!(agent.permissions.write, Some(PermissionSetting::Deny));
+        assert_eq!(agent.permissions.bash, Some(PermissionSetting::Ask));
+        let layers = config.body_layers("override-model", Some("reviewer"), None, Value::Null);
+        assert_eq!(layers.len(), 4);
+        assert_eq!(layers[1]["temperature"], 0.1);
+        assert_eq!(layers[2]["temperature"], 0.2);
+    }
+
+    #[test]
+    fn rejects_invalid_markdown_agent_front_matter() {
+        let directory = tempdir().expect("temporary directory");
+        let agents = directory.path().join("agents");
+        fs::create_dir(&agents).expect("agent directory creates");
+        fs::write(agents.join("broken.md"), "---\nunknown: true\n---\nPrompt")
+            .expect("agent fixture writes");
+        let path = directory.path().join("piqo.toml");
+        fs::write(&path, "").expect("config fixture writes");
+
+        assert!(matches!(
+            PiqoConfig::load(&path),
+            Err(ConfigError::InvalidAgentDefinition { .. })
+        ));
     }
 
     #[test]

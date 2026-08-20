@@ -122,6 +122,7 @@ async fn lists_sessions_with_the_default_page_size() {
     }
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/api/v1/sessions")
@@ -204,6 +205,7 @@ async fn openapi_documents_run_and_queue_routes() {
         ("/api/v1/sessions/{session_id}/forks", "post"),
         ("/api/v1/providers", "get"),
         ("/api/v1/providers", "post"),
+        ("/api/v1/agents", "get"),
         ("/api/v1/providers/{provider}", "get"),
         ("/api/v1/providers/{provider}", "patch"),
         ("/api/v1/providers/{provider}", "delete"),
@@ -721,6 +723,7 @@ async fn validates_project_paths_and_session_project_references() {
     assert_eq!(response.status(), 400);
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -735,5 +738,107 @@ async fn validates_project_paths_and_session_project_references() {
     assert_eq!(
         json_body(response).await["error"]["code"],
         "project_not_found"
+    );
+}
+
+#[tokio::test]
+async fn lists_markdown_agents_and_uses_their_provider_and_model_defaults() {
+    let database = NamedTempFile::new().expect("temporary sqlite file");
+    let directory = tempdir().expect("temporary configuration directory");
+    let agents = directory.path().join("agents");
+    std::fs::create_dir(&agents).expect("agent directory creates");
+    std::fs::write(
+        agents.join("reviewer.md"),
+        r#"---
+description: Read-only reviewer
+provider: local
+model: reviewer-model
+permissions:
+  read: allow
+  write: deny
+  bash: ask
+---
+Review the change carefully.
+"#,
+    )
+    .expect("agent fixture writes");
+    let config = directory.path().join("piqo.toml");
+    std::fs::write(
+        &config,
+        r#"[providers.local]
+base_url = "http://127.0.0.1:9"
+"#,
+    )
+    .expect("configuration fixture writes");
+    let store = SqliteStore::connect_file(database.path())
+        .await
+        .expect("store opens");
+    let app = router(AppState::with_config_file(store, config).expect("configuration loads"));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/agents")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("request succeeds");
+    assert_eq!(response.status(), 200);
+    let agents = json_body(response).await;
+    assert_eq!(agents["agents"][0]["id"], "reviewer");
+    assert_eq!(agents["agents"][0]["permissions"]["write"], "deny");
+    assert!(agents["agents"][0].get("instructions").is_none());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/sessions")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .expect("request builds"),
+        )
+        .await
+        .expect("request succeeds");
+    let session_id = json_body(response).await["id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/sessions/{session_id}/runs"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"agent": "reviewer", "input": "Review this"}).to_string(),
+                ))
+                .expect("request builds"),
+        )
+        .await
+        .expect("request succeeds");
+    assert_eq!(response.status(), 202);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/sessions/{session_id}/runs"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"agent": "missing", "input": "Review this"}).to_string(),
+                ))
+                .expect("request builds"),
+        )
+        .await
+        .expect("request succeeds");
+    assert_eq!(response.status(), 400);
+    assert_eq!(
+        json_body(response).await["error"]["code"],
+        "agent_not_found"
     );
 }

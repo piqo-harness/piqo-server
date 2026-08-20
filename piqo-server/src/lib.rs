@@ -45,10 +45,11 @@ use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi, ToSchema};
 
 pub use config::{
-    ConfigError, ConfigManager, ConfigSnapshot, CreateProviderRequest, DiscoveryStatus,
-    ModelDiscovery, ModelSource, PiqoConfig, ProviderCatalogEntry, ProviderConfig,
-    ProviderCredentialInput, ProviderCredentialSummary, ProviderModelsResponse,
-    ReplaceProviderModelsRequest, UpdateProviderRequest,
+    AgentConfigOverride, AgentDefinition, AgentPermissions, ConfigError, ConfigManager,
+    ConfigSnapshot, CreateProviderRequest, DiscoveryStatus, ModelDiscovery, ModelSource,
+    PermissionSetting, PiqoConfig, ProviderCatalogEntry, ProviderConfig, ProviderCredentialInput,
+    ProviderCredentialSummary, ProviderModelsResponse, ReplaceProviderModelsRequest,
+    UpdateProviderRequest,
 };
 pub use runtime::{
     ensure_private_directory, prepare_server, PreparedServer, ServerError, ServerOptions,
@@ -332,13 +333,27 @@ pub struct ForkSessionRequest {
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateRunRequest {
-    pub provider: String,
-    pub model: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
     pub input: Value,
     pub agent: Option<String>,
     pub variant: Option<String>,
     #[serde(default)]
     pub body: Value,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AgentCatalogEntry {
+    pub id: String,
+    pub description: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub permissions: AgentPermissions,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AgentCatalogResponse {
+    pub agents: Vec<AgentCatalogEntry>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -562,6 +577,11 @@ impl IntoResponse for ApiError {
                 "provider_not_found",
                 format!("provider {name} was not found"),
             ),
+            Self::Config(ConfigError::AgentNotFound(name)) => (
+                StatusCode::BAD_REQUEST,
+                "agent_not_found",
+                format!("agent {name} was not found"),
+            ),
             Self::Config(ConfigError::ProviderAlreadyExists(name)) => (
                 StatusCode::CONFLICT,
                 "provider_already_exists",
@@ -729,6 +749,7 @@ pub fn router_with_token(state: AppState, token: Option<String>) -> Router {
             "/api/v1/providers",
             get(list_providers).post(create_provider),
         )
+        .route("/api/v1/agents", get(list_agents))
         .route(
             "/api/v1/providers/{provider}",
             get(get_provider)
@@ -1233,6 +1254,31 @@ async fn list_providers(
 }
 
 #[utoipa::path(
+    get,
+    path = "/api/v1/agents",
+    tag = "agents",
+    responses((status = 200, body = AgentCatalogResponse), (status = 503, body = ErrorResponse))
+)]
+async fn list_agents(
+    State(state): State<AppState>,
+) -> Result<Json<AgentCatalogResponse>, ApiError> {
+    Ok(Json(AgentCatalogResponse {
+        agents: state
+            .config()
+            .agents()?
+            .into_iter()
+            .map(|agent| AgentCatalogEntry {
+                id: agent.id,
+                description: agent.description,
+                provider: agent.provider,
+                model: agent.model,
+                permissions: agent.permissions,
+            })
+            .collect(),
+    }))
+}
+
+#[utoipa::path(
     post,
     path = "/api/v1/config/reload",
     tag = "configuration",
@@ -1402,9 +1448,30 @@ async fn create_run(
     ApiPath(session_id): ApiPath<String>,
     ApiJson(request): ApiJson<CreateRunRequest>,
 ) -> Result<(StatusCode, Json<RunAcceptedResponse>), ApiError> {
+    let agent = request
+        .agent
+        .as_deref()
+        .map(|name| state.config().agent(name))
+        .transpose()?;
+    let provider = request
+        .provider
+        .or_else(|| agent.as_ref().and_then(|agent| agent.provider.clone()))
+        .filter(|provider| !provider.is_empty())
+        .ok_or_else(|| ApiError::BadRequest {
+            code: "invalid_request",
+            message: "provider is required unless supplied by the selected agent".to_owned(),
+        })?;
+    let model = request
+        .model
+        .or_else(|| agent.as_ref().and_then(|agent| agent.model.clone()))
+        .filter(|model| !model.is_empty())
+        .ok_or_else(|| ApiError::BadRequest {
+            code: "invalid_request",
+            message: "model is required unless supplied by the selected agent".to_owned(),
+        })?;
     let run_request = RunRequest {
-        provider: request.provider,
-        model: request.model,
+        provider,
+        model,
         input: request.input,
         agent: request.agent,
         variant: request.variant,
@@ -1572,6 +1639,7 @@ fn event_for_sse(event: RecordedEvent) -> Event {
         stream_events,
         fork_session,
         list_providers,
+        list_agents,
         create_provider,
         get_provider,
         update_provider,
@@ -1605,6 +1673,10 @@ fn event_for_sse(event: RecordedEvent) -> Event {
         RunResponse,
         ApiRun,
         ProviderCatalogResponse,
+        AgentCatalogResponse,
+        AgentCatalogEntry,
+        AgentPermissions,
+        PermissionSetting,
         ConfigReloadResponse,
         ProviderCatalogEntry,
         CreateProviderRequest,
@@ -1622,6 +1694,7 @@ fn event_for_sse(event: RecordedEvent) -> Event {
         (name = "sessions", description = "Durable session and event-log API"),
         (name = "configuration", description = "Runtime configuration API"),
         (name = "providers", description = "Provider configuration API"),
+        (name = "agents", description = "Configured agent definitions API"),
         (name = "models", description = "Provider model catalog API")
     )
 )]
