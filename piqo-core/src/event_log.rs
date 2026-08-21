@@ -102,6 +102,13 @@ pub enum SemanticEvent {
         arguments: Value,
         #[serde(default)]
         raw_arguments: String,
+        #[serde(default)]
+        native: bool,
+    },
+    ToolExecutionStarted {
+        run_id: String,
+        call_id: String,
+        execution_id: String,
     },
     ToolResult {
         #[serde(default)]

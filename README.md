@@ -31,21 +31,26 @@ Available today:
 
 Designed or partially implemented, but **not wired into the server yet**:
 
-- native `read`, `write`, `edit`, and `bash` tool execution;
 - MCP server connections and plugin subprocesses;
-- permission approval/denial endpoints and enforcement in the run loop;
 - orchestrator/subagent execution;
 - context compaction;
 - TLS termination and remote access;
 - a TUI, desktop UI, or other interactive client.
 
-If a model emits a tool call today, piqo records it and changes the run to
-`requires_action`. Clients submit each result with
+Provider-owned tool calls are recorded and pause the run at `requires_action`.
+Clients submit their result with
 `POST /api/v1/sessions/{session_id}/runs/{run_id}/tool_calls/{call_id}/result`
 and `{ "result": <any JSON value> }`; piqo resumes the same run after every
-call in the provider turn has a result. Tool execution and permission decisions
-remain client-owned and are not implemented by this endpoint. Runs created with
-caller-owned `body.messages` or `body.input` cannot be continued this way.
+call in the provider turn has a result. Runs created with caller-owned
+`body.messages` or `body.input` cannot be continued this way.
+
+For project-backed sessions, named agents may advertise Piqo-native `read`,
+`write`, `edit`, and `bash` tools through their `allow` or `ask` permissions.
+Piqo executes an allowed native call itself and appends its result before
+continuing the same provider turn. Native calls never run outside the selected
+project, reject symlinks, require explicit `create` or `overwrite` mode for
+writes, and use bounded output and shell duration. A native call is not
+client-result-submittable.
 
 Tool calls are permission-gated. `allow` accepts a client-owned result, `ask`
 creates a durable permission request, and `deny` returns a deterministic
@@ -395,9 +400,31 @@ body:
 Review the supplied change for correctness, security, and missing tests.
 ```
 
-`read`, `write`, and `bash` accept `allow`, `ask`, or `deny`. These
-settings are retained in the resolved configuration, but are not enforced until
-tool execution is connected to the server.
+`read`, `write`, and `bash` accept `allow`, `ask`, or `deny`; `edit` shares the
+`write` permission. For a project-backed session, `allow` lets Piqo execute the
+corresponding native tool and `ask` creates a durable approval request first.
+Sessions without a project never receive native tools. A caller-supplied
+`body.tools` remains provider-owned and is never executed as a native tool.
+
+Native tools are enabled by default. Optional server limits and an absolute
+shell path can be set in `piqo.toml`:
+
+```toml
+[native_tools]
+max_read_bytes = 51200
+max_read_lines = 2000
+max_write_bytes = 1048576
+max_result_bytes = 51200
+max_result_lines = 2000
+bash_timeout_seconds = 30
+termination_grace_millis = 1000
+# shell = "/bin/zsh"
+```
+
+The shell starts without profiles and with a minimal environment; provider
+credentials are not passed through. On Unix Piqo uses the configured shell, the
+user shell, `bash`, or `/bin/sh`; on Windows it selects PowerShell, Git Bash, or
+`cmd` when available.
 
 `piqo.toml` can override any file-defined agent field without replacing its
 Markdown definition:

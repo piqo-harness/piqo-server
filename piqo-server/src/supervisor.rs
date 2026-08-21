@@ -11,6 +11,7 @@ use piqo_core::{
     RecordedEvent, RunProjection, RunStatus, SemanticEvent, SessionPhase,
 };
 use piqo_provider::{merge_request_bodies, ProviderDelta, ProviderProtocol, ProviderTransport};
+use piqo_tools::{NativeExecutor, NativeTool, ShellProgram};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, Mutex};
@@ -165,13 +166,33 @@ impl SessionSupervisor {
 
     pub async fn resume_ready_actions_after_restart(&self) -> Result<(), StoreError> {
         for session_id in self.store.session_ids().await? {
-            if self
-                .store
-                .projection(&session_id)
-                .await?
-                .ready_action_run()
-                .is_some()
-            {
+            let projection = self.store.projection(&session_id).await?;
+            let interrupted_native_runs = projection
+                .runs
+                .values()
+                .filter(|run| {
+                    run.status == RunStatus::RequiresAction
+                        && run.tool_calls.values().any(|call| {
+                            call.native && call.execution_id.is_some() && call.result.is_none()
+                        })
+                })
+                .map(|run| run.run_id.clone())
+                .collect::<Vec<_>>();
+            if !interrupted_native_runs.is_empty() {
+                self.append_many(
+                    &session_id,
+                    interrupted_native_runs
+                        .into_iter()
+                        .map(|run_id| SemanticEvent::RunInterrupted {
+                            run_id,
+                            reason: "native_execution_interrupted_by_restart".to_owned(),
+                        })
+                        .collect(),
+                )
+                .await?;
+                continue;
+            }
+            if projection.ready_action_run().is_some() {
                 self.spawn_worker(session_id).await;
             }
         }
@@ -316,6 +337,9 @@ impl SessionSupervisor {
                 }
                 None => return Err(StoreError::ToolCallNotFound(call_id.to_owned())),
             };
+            if call.native {
+                return Err(StoreError::NativeToolManaged(call_id.to_owned()));
+            }
             let permission = projection.pending_permissions.values().find(|permission| {
                 permission.run_id == run_id && permission.call_id.as_deref() == Some(call_id)
             });
@@ -487,22 +511,19 @@ impl SessionSupervisor {
             })?;
             events.push(SemanticEvent::ToolResult { run_id: run_id.to_owned(), call_id, agent_id: request.agent_id.clone(), tool_name: request.tool_name.clone(), result: json!({"error":{"code":"permission_denied","message":"tool invocation was denied by permission policy"}}) });
         }
-        let refreshed = self.store.projection(session_id).await?;
-        let run = refreshed
-            .runs
-            .get(run_id)
-            .ok_or_else(|| StoreError::RunNotFound(run_id.to_owned()))?;
-        let resolving_call = request.call_id.as_deref();
-        if decision == PermissionDecision::Deny
-            && run
-                .tool_calls
-                .values()
-                .all(|call| call.result.is_some() || Some(call.call_id.as_str()) == resolving_call)
-        {
-            events.push(SemanticEvent::QueueResumed);
-        }
         self.append_many(session_id, events).await?;
-        if decision == PermissionDecision::Deny {
+        if decision == PermissionDecision::Allow {
+            if self
+                .execute_approved_native_calls(session_id, run_id)
+                .await?
+            {
+                self.spawn_worker(session_id.to_owned()).await;
+            }
+        } else if decision == PermissionDecision::Deny
+            && self
+                .resume_if_tool_results_ready(session_id, run_id)
+                .await?
+        {
             self.spawn_worker(session_id.to_owned()).await;
         }
         Ok(())
@@ -908,7 +929,20 @@ impl SessionSupervisor {
                     Ok(projection) => projection,
                     Err(error) => return ExecutionResult::Failed(error.to_string(), false),
                 };
-                let body = match build_body(&config, &provider.protocol, &request, &projection) {
+                let native_tools = match self.store.get_session(session_id).await {
+                    Ok(session) if session.project_id.is_some() => {
+                        configured_native_tools(&config, &request)
+                    }
+                    Ok(_) => Vec::new(),
+                    Err(error) => return ExecutionResult::Failed(error.to_string(), false),
+                };
+                let body = match build_body(
+                    &config,
+                    &provider.protocol,
+                    &request,
+                    &projection,
+                    &native_tools,
+                ) {
                     Ok(body) => body,
                     Err(error) => return ExecutionResult::Failed(error.to_string(), false),
                 };
@@ -1353,6 +1387,11 @@ impl SessionSupervisor {
                 arguments,
             } => {
                 let call_id = call_id.unwrap_or_else(|| Uuid::now_v7().to_string());
+                let tool_name = name.unwrap_or_else(|| "function".into());
+                let native = self
+                    .is_native_call(session_id, run_id, &tool_name)
+                    .await
+                    .unwrap_or(false);
                 self.append(
                     session_id,
                     SemanticEvent::ToolCallEmitted {
@@ -1360,10 +1399,11 @@ impl SessionSupervisor {
                         assistant_message_id: assistant_message_id.to_owned(),
                         call_id: call_id.clone(),
                         agent_id: "assistant".into(),
-                        tool_name: name.unwrap_or_else(|| "function".into()),
+                        tool_name,
                         arguments: serde_json::from_str(&arguments)
                             .unwrap_or_else(|_| json!({"raw": arguments})),
                         raw_arguments: arguments,
+                        native,
                     },
                 )
                 .await?;
@@ -1412,7 +1452,7 @@ impl SessionSupervisor {
                     .as_ref()
                     .and_then(|agent| match call.tool_name.as_str() {
                         "read" => agent.permissions.read,
-                        "write" => agent.permissions.write,
+                        "write" | "edit" => agent.permissions.write,
                         "bash" => agent.permissions.bash,
                         _ => None,
                     });
@@ -1429,7 +1469,9 @@ impl SessionSupervisor {
                         session_id,
                         session.project_id.as_deref(),
                         &agent_id,
-                        &call.tool_name,
+                        NativeTool::parse(&call.tool_name)
+                            .map(NativeTool::permission_name)
+                            .unwrap_or(&call.tool_name),
                     )
                     .await?
                 {
@@ -1486,11 +1528,145 @@ impl SessionSupervisor {
                 }
             }
         }
-        if !has_pending_approval {
-            events.push(SemanticEvent::QueueResumed);
-        }
         self.append_many(session_id, events).await?;
+        if !has_pending_approval {
+            self.execute_approved_native_calls(session_id, &run.run_id)
+                .await?;
+        }
         Ok(())
+    }
+
+    async fn is_native_call(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        tool_name: &str,
+    ) -> Result<bool, StoreError> {
+        let Some(tool) = NativeTool::parse(tool_name) else {
+            return Ok(false);
+        };
+        let session = self.store.get_session(session_id).await?;
+        if session.project_id.is_none() {
+            return Ok(false);
+        }
+        let projection = self.store.projection(session_id).await?;
+        let run = projection
+            .runs
+            .get(run_id)
+            .ok_or_else(|| StoreError::RunNotFound(run_id.to_owned()))?;
+        let request: RunRequest =
+            serde_json::from_value(run.request.clone()).map_err(StoreError::Json)?;
+        if request.body.get("tools").is_some() {
+            return Ok(false);
+        }
+        let agent_id = request.agent.unwrap_or_else(|| "assistant".to_owned());
+        let configured = self.config.agent(&agent_id).ok();
+        let decision = configured.and_then(|agent| match tool {
+            NativeTool::Read => agent.permissions.read,
+            NativeTool::Write | NativeTool::Edit => agent.permissions.write,
+            NativeTool::Bash => agent.permissions.bash,
+        });
+        Ok(matches!(
+            decision,
+            Some(PermissionSetting::Allow | PermissionSetting::Ask)
+        ))
+    }
+
+    async fn execute_approved_native_calls(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<bool, StoreError> {
+        let session = self.store.get_session(session_id).await?;
+        let Some(project_id) = session.project_id else {
+            return Ok(false);
+        };
+        let project = self.store.get_project(&project_id).await?;
+        loop {
+            let projection = self.store.projection(session_id).await?;
+            let run = projection
+                .runs
+                .get(run_id)
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_owned()))?;
+            let Some(call) = run.tool_calls.values().find(|call| {
+                call.native
+                    && call.result.is_none()
+                    && call.execution_id.is_none()
+                    && projection.pending_permissions.values().any(|permission| {
+                        permission.run_id == run_id
+                            && permission.call_id.as_deref() == Some(call.call_id.as_str())
+                            && permission.decision == Some(PermissionDecision::Allow)
+                    })
+            }) else {
+                break;
+            };
+            let tool = NativeTool::parse(&call.tool_name)
+                .ok_or_else(|| StoreError::InvalidRequest("unknown native tool".into()))?;
+            let call_id = call.call_id.clone();
+            let agent_id = call.agent_id.clone();
+            let tool_name = call.tool_name.clone();
+            let arguments = call.arguments.clone();
+            self.append(
+                session_id,
+                SemanticEvent::ToolExecutionStarted {
+                    run_id: run_id.to_owned(),
+                    call_id: call_id.clone(),
+                    execution_id: Uuid::now_v7().to_string(),
+                },
+            )
+            .await?;
+            let config = self
+                .config
+                .snapshot()
+                .map_err(|error| StoreError::ProviderUnavailable(error.to_string()))?;
+            let shell = ShellProgram::discover(config.native_tools.shell.as_deref())
+                .map_err(|error| StoreError::InvalidRequest(error.to_string()))?;
+            let executor = NativeExecutor::new(
+                PathBuf::from(&project.path),
+                config.native_tools.limits(),
+                shell,
+            )
+            .map_err(|error| StoreError::InvalidRequest(error.to_string()))?;
+            let cancellation = self
+                .cancellations
+                .lock()
+                .await
+                .get(run_id)
+                .cloned()
+                .unwrap_or_else(CancellationToken::new);
+            let result = executor.execute(tool, &arguments, cancellation).await;
+            self.append(
+                session_id,
+                SemanticEvent::ToolResult {
+                    run_id: run_id.to_owned(),
+                    call_id,
+                    agent_id,
+                    tool_name,
+                    result,
+                },
+            )
+            .await?;
+        }
+        self.resume_if_tool_results_ready(session_id, run_id).await
+    }
+
+    async fn resume_if_tool_results_ready(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<bool, StoreError> {
+        let projection = self.store.projection(session_id).await?;
+        let run = projection
+            .runs
+            .get(run_id)
+            .ok_or_else(|| StoreError::RunNotFound(run_id.to_owned()))?;
+        if run.status == RunStatus::RequiresAction
+            && run.tool_calls.values().all(|call| call.result.is_some())
+        {
+            self.append(session_id, SemanticEvent::QueueResumed).await?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     async fn finish_run(
@@ -1756,6 +1932,7 @@ fn build_body(
     protocol: &ProviderProtocol,
     request: &RunRequest,
     projection: &piqo_core::SessionProjection,
+    native_tools: &[NativeTool],
 ) -> Result<Value, StoreError> {
     let layers = config.body_layers(
         &request.model,
@@ -1772,6 +1949,10 @@ fn build_body(
         .entry("model")
         .or_insert_with(|| Value::String(request.model.clone()));
     object.entry("stream").or_insert(Value::Bool(true));
+    if !native_tools.is_empty() {
+        let definitions = native_tool_definitions(protocol, native_tools);
+        object.entry("tools").or_insert(Value::Array(definitions));
+    }
     let mut transcript = projection
         .messages
         .iter()
@@ -1856,6 +2037,63 @@ fn build_body(
         }
     }
     Ok(body)
+}
+
+fn configured_native_tools(config: &PiqoConfig, request: &RunRequest) -> Vec<NativeTool> {
+    if request.body.get("tools").is_some() {
+        return Vec::new();
+    }
+    let Some(agent_name) = request.agent.as_deref() else {
+        return Vec::new();
+    };
+    let Ok(agent) = config.agent(agent_name) else {
+        return Vec::new();
+    };
+    [
+        (NativeTool::Read, agent.permissions.read),
+        (NativeTool::Write, agent.permissions.write),
+        (NativeTool::Edit, agent.permissions.write),
+        (NativeTool::Bash, agent.permissions.bash),
+    ]
+    .into_iter()
+    .filter_map(|(tool, permission)| {
+        matches!(
+            permission,
+            Some(PermissionSetting::Allow | PermissionSetting::Ask)
+        )
+        .then_some(tool)
+    })
+    .collect()
+}
+
+fn native_tool_definitions(protocol: &ProviderProtocol, tools: &[NativeTool]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|tool| {
+            let (description, parameters) = match tool {
+                NativeTool::Read => (
+                    "Read a UTF-8 regular file inside the project workspace.",
+                    json!({"type":"object","additionalProperties":false,"required":["filePath"],"properties":{"filePath":{"type":"string"},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1}}}),
+                ),
+                NativeTool::Write => (
+                    "Create or atomically overwrite a UTF-8 file inside the project workspace.",
+                    json!({"type":"object","additionalProperties":false,"required":["filePath","content","mode"],"properties":{"filePath":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["create","overwrite"]}}}),
+                ),
+                NativeTool::Edit => (
+                    "Replace exact text in an existing UTF-8 file inside the project workspace.",
+                    json!({"type":"object","additionalProperties":false,"required":["filePath","oldString","newString"],"properties":{"filePath":{"type":"string"},"oldString":{"type":"string"},"newString":{"type":"string"},"replaceAll":{"type":"boolean"}}}),
+                ),
+                NativeTool::Bash => (
+                    "Execute one command with a project workspace working directory.",
+                    json!({"type":"object","additionalProperties":false,"required":["command"],"properties":{"command":{"type":"string"},"cwd":{"type":"string"}}}),
+                ),
+            };
+            match protocol {
+                ProviderProtocol::ChatCompletions => json!({"type":"function","function":{"name":tool.name(),"description":description,"parameters":parameters}}),
+                ProviderProtocol::Responses => json!({"type":"function","name":tool.name(),"description":description,"parameters":parameters}),
+            }
+        })
+        .collect()
 }
 
 fn role_name(role: MessageRole) -> &'static str {
@@ -2143,6 +2381,7 @@ mod tests {
             &ProviderProtocol::ChatCompletions,
             &request,
             &projection,
+            &[],
         )
         .expect("body builds");
         assert_eq!(body["messages"][0]["role"], "system");
@@ -2157,12 +2396,54 @@ mod tests {
             &ProviderProtocol::ChatCompletions,
             &request,
             &projection,
+            &[],
         )
         .expect("body builds");
         assert_eq!(
             body["messages"],
             json!([{"role": "user", "content": "raw"}])
         );
+    }
+
+    #[test]
+    fn advertises_only_native_tools_enabled_by_the_named_agent() {
+        let config: PiqoConfig = toml::from_str(
+            r#"
+                [agents.worker.permissions]
+                read = "allow"
+                write = "ask"
+                bash = "deny"
+            "#,
+        )
+        .expect("config parses");
+        let request = RunRequest {
+            provider: "local".to_owned(),
+            model: "model".to_owned(),
+            input: Value::Null,
+            agent: Some("worker".to_owned()),
+            variant: None,
+            body: json!({}),
+        };
+        let tools = configured_native_tools(&config, &request);
+        assert_eq!(
+            tools,
+            vec![NativeTool::Read, NativeTool::Write, NativeTool::Edit]
+        );
+        let body = build_body(
+            &config,
+            &ProviderProtocol::ChatCompletions,
+            &request,
+            &piqo_core::SessionProjection::new("session"),
+            &tools,
+        )
+        .expect("body builds");
+        assert_eq!(body["tools"].as_array().unwrap().len(), 3);
+
+        let caller_owned = RunRequest {
+            body: json!({"tools": []}),
+            ..request
+        };
+        assert!(configured_native_tools(&config, &caller_owned).is_empty());
     }
 
     #[tokio::test]

@@ -33,7 +33,7 @@ sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runti
 thiserror = "2"
 toml = "0.8"
 toml_edit = "0.22"
-tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tower = { version = "0.5", features = ["util"] }

@@ -104,6 +104,8 @@ pub enum StoreError {
     ToolResultConflict(String),
     #[error("tool results cannot be submitted for a caller-owned transcript")]
     CallerOwnedTranscript,
+    #[error("native tool call {0} is executed by the server")]
+    NativeToolManaged(String),
     #[error("provider {0} was not found")]
     ProviderNotFound(String),
     #[error("provider unavailable: {0}")]

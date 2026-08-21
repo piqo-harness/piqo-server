@@ -1355,9 +1355,16 @@ dependencies = [
 name = "piqo-tools"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "piqo-core",
  "rmcp",
+ "serde",
  "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]

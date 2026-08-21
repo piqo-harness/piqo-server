@@ -92,8 +92,8 @@ changes state; detailed task tracking belongs in an issue or pull request.
 | Milestone | State | Tracking issue/PR | Last updated | Notes |
 | --- | --- | --- | --- | --- |
 | M1 | complete | — | 2026-08-21 | Action-result continuation merged. |
-| M2 | implementing | — | 2026-08-21 | Durable permission workflow in progress. |
-| M3 | not_started | — | — | — |
+| M2 | complete | — | 2026-08-21 | Durable permission workflow merged. |
+| M3 | implementing | — | 2026-08-21 | Project-scoped native tools under implementation. |
 | M4 | not_started | — | — | — |
 | M5 | not_started | — | — | — |
 | M6 | not_started | — | — | — |

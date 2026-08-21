@@ -11,6 +11,7 @@ use std::{
 
 use chrono::{SecondsFormat, Utc};
 use piqo_provider::{ProviderProtocol, ProviderTransport};
+use piqo_tools::NativeToolLimits;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -30,8 +31,71 @@ pub struct PiqoConfig {
     pub agents: HashMap<String, AgentConfigOverride>,
     #[serde(default)]
     pub variants: HashMap<String, BodyLayer>,
+    #[serde(default)]
+    pub native_tools: NativeToolsConfig,
     #[serde(skip)]
     markdown_agents: HashMap<String, AgentDefinition>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeToolsConfig {
+    pub max_read_bytes: Option<usize>,
+    pub max_read_lines: Option<usize>,
+    pub max_write_bytes: Option<usize>,
+    pub max_result_bytes: Option<usize>,
+    pub max_result_lines: Option<usize>,
+    pub bash_timeout_seconds: Option<u64>,
+    pub termination_grace_millis: Option<u64>,
+    pub shell: Option<PathBuf>,
+}
+
+impl NativeToolsConfig {
+    pub fn limits(&self) -> NativeToolLimits {
+        let defaults = NativeToolLimits::default();
+        NativeToolLimits {
+            max_read_bytes: self.max_read_bytes.unwrap_or(defaults.max_read_bytes),
+            max_read_lines: self.max_read_lines.unwrap_or(defaults.max_read_lines),
+            max_write_bytes: self.max_write_bytes.unwrap_or(defaults.max_write_bytes),
+            max_result_bytes: self.max_result_bytes.unwrap_or(defaults.max_result_bytes),
+            max_result_lines: self.max_result_lines.unwrap_or(defaults.max_result_lines),
+            bash_timeout: Duration::from_secs(
+                self.bash_timeout_seconds
+                    .unwrap_or(defaults.bash_timeout.as_secs()),
+            ),
+            termination_grace: Duration::from_millis(
+                self.termination_grace_millis
+                    .unwrap_or(defaults.termination_grace.as_millis() as u64),
+            ),
+        }
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        for (name, value) in [
+            ("max_read_bytes", self.max_read_bytes),
+            ("max_read_lines", self.max_read_lines),
+            ("max_write_bytes", self.max_write_bytes),
+            ("max_result_bytes", self.max_result_bytes),
+            ("max_result_lines", self.max_result_lines),
+        ] {
+            if value == Some(0) {
+                return Err(ConfigError::InvalidNativeTools(format!(
+                    "{name} must be greater than zero"
+                )));
+            }
+        }
+        if self.bash_timeout_seconds == Some(0) || self.termination_grace_millis == Some(0) {
+            return Err(ConfigError::InvalidNativeTools(
+                "shell durations must be greater than zero".to_owned(),
+            ));
+        }
+        if self.shell.as_ref().is_some_and(|path| !path.is_absolute()) {
+            return Err(ConfigError::InvalidNativeTools(
+                "shell must be an absolute path".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -272,6 +336,8 @@ pub enum ConfigError {
     },
     #[error("invalid provider configuration: {0}")]
     InvalidProvider(String),
+    #[error("invalid native tool configuration: {0}")]
+    InvalidNativeTools(String),
     #[error("configuration is read-only in this server instance")]
     ReadOnly,
     #[error("configuration state lock was poisoned")]
@@ -323,6 +389,7 @@ impl PiqoConfig {
             validate_provider_name(name)?;
             provider.validate(name)?;
         }
+        self.native_tools.validate()?;
         Ok(())
     }
 
