@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+jsonschema.workspace = true
 piqo-core = { path = "../piqo-core" }
 rmcp.workspace = true
 serde.workspace = true

@@ -31,7 +31,7 @@ Available today:
 
 Designed or partially implemented, but **not wired into the server yet**:
 
-- MCP server connections and plugin subprocesses;
+- plugin protocols beyond MCP stdio;
 - orchestrator/subagent execution;
 - context compaction;
 - TLS termination and remote access;
@@ -456,6 +456,33 @@ After merging, piqo fills these fields only when absent:
 
 Consequently, an individual request body can override any of them.
 
+### MCP servers
+
+Configured MCP servers run locally over stdio. They receive a minimal base
+environment (`PATH`, `HOME`, and temporary-directory variables); map any other
+child variable explicitly to a host environment variable. The values are never
+returned through the API.
+
+```toml
+[mcp_servers.files]
+command = "/usr/local/bin/example-mcp"
+args = ["--stdio"]
+cwd = "/Users/example/src/project"
+environment = { API_TOKEN = "EXAMPLE_MCP_TOKEN" }
+startup_timeout_seconds = 10
+call_timeout_seconds = 30
+max_result_bytes = 51200
+termination_grace_millis = 1000
+max_restart_attempts = 3
+```
+
+MCP tools are exposed as `mcp__<server>__<tool>` only when a named agent grants
+`permissions.mcp` or a targeted `permissions.tools` rule `allow` or `ask`.
+The default is `deny`; explicit targeted rules override the MCP default. Piqo
+manages these calls itself, including permission approval and continuation, so
+clients cannot submit their results. Inspect non-secret server state and the
+published catalog with `GET /api/v1/mcp/servers`.
+
 ## Inspect the exact provider request
 
 Start the server with a dump directory:
@@ -546,6 +573,7 @@ curl -N \
 | `GET`, `PUT`, `DELETE` | `/api/v1/providers/{provider}/models` | Read, replace, or clear the manual model catalog |
 | `POST` | `/api/v1/providers/{provider}/models/refresh` | Refresh automatic discovery when no manual override exists |
 | `POST` | `/api/v1/config/reload` | Atomically reload `piqo.toml` |
+| `GET` | `/api/v1/mcp/servers` | MCP server diagnostics and published tool catalog |
 | `POST` | `/api/v1/sessions/{id}/runs` | Queue a run |
 | `GET` | `/api/v1/sessions/{id}/runs/{run_id}` | Inspect a run |
 | `POST` | `/api/v1/sessions/{id}/runs/{run_id}/cancel` | Cancel a run |

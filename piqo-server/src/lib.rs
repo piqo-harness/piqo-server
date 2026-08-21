@@ -34,6 +34,7 @@ use axum::{
 #[cfg(test)]
 use piqo_core::SemanticEvent;
 use piqo_core::{EventId, RecordedEvent, RunProjection, RunStatus, SessionPhase};
+use piqo_tools::McpManager;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -79,6 +80,7 @@ pub struct AppState {
     hub: EventHub,
     supervisor: SessionSupervisor,
     config: ConfigManager,
+    mcp: McpManager,
     lifecycle: Arc<LifecycleState>,
     shutdown: CancellationToken,
     fatal_reload_error: Arc<Mutex<Option<String>>>,
@@ -165,10 +167,19 @@ impl AppState {
         shutdown: CancellationToken,
     ) -> Self {
         let hub = EventHub::new();
+        let mcp = McpManager::new(
+            config
+                .snapshot()
+                .expect("configuration snapshot is available")
+                .mcp_servers
+                .clone(),
+        )
+        .expect("configuration was validated before app state construction");
         let supervisor = SessionSupervisor::with_dump_dir_and_shutdown(
             store.clone(),
             config.clone(),
             hub.clone(),
+            mcp.clone(),
             dump_dir,
             shutdown.clone(),
         );
@@ -177,6 +188,7 @@ impl AppState {
             hub,
             supervisor,
             config,
+            mcp,
             lifecycle: Arc::new(LifecycleState::default()),
             shutdown,
             fatal_reload_error: Arc::new(Mutex::new(None)),
@@ -204,8 +216,17 @@ impl AppState {
         &self.config
     }
 
+    pub fn mcp(&self) -> &McpManager {
+        &self.mcp
+    }
+
     async fn reload_config(&self) -> Result<ConfigSnapshot, ConfigError> {
-        self.config.reload().await
+        let snapshot = self.config.reload().await?;
+        self.mcp
+            .reconcile(snapshot.config.mcp_servers.clone())
+            .await
+            .map_err(|error| ConfigError::InvalidMcp(error.to_string()))?;
+        Ok(snapshot)
     }
 
     async fn request_fatal_reload_shutdown(&self, message: String) {
@@ -731,6 +752,11 @@ impl IntoResponse for ApiError {
                 "native_tool_managed",
                 format!("native tool call {id} is executed by the server"),
             ),
+            Self::Store(StoreError::McpToolManaged(id)) => (
+                StatusCode::CONFLICT,
+                "mcp_tool_managed",
+                format!("MCP tool call {id} is executed by the server"),
+            ),
             Self::Store(StoreError::CallerOwnedTranscript) => (
                 StatusCode::CONFLICT,
                 "caller_owned_transcript",
@@ -819,6 +845,7 @@ pub fn router_with_token(state: AppState, token: Option<String>) -> Router {
             post(refresh_provider_models),
         )
         .route("/api/v1/config/reload", post(reload_config))
+        .route("/api/v1/mcp/servers", get(list_mcp_servers))
         .route("/api/v1/sessions/{session_id}/runs", post(create_run))
         .route("/api/v1/sessions/{session_id}/runs/{run_id}", get(get_run))
         .route(
@@ -1385,6 +1412,18 @@ async fn reload_config(
 }
 
 #[utoipa::path(
+    get,
+    path = "/api/v1/mcp/servers",
+    tag = "configuration",
+    responses((status = 200, description = "MCP server diagnostics without environment values"))
+)]
+async fn list_mcp_servers(
+    State(state): State<AppState>,
+) -> Json<Vec<piqo_tools::McpServerDiagnostics>> {
+    Json(state.mcp().diagnostics().await)
+}
+
+#[utoipa::path(
     post,
     path = "/api/v1/providers",
     tag = "providers",
@@ -1821,6 +1860,7 @@ fn event_for_sse(event: RecordedEvent) -> Event {
         clear_provider_models,
         refresh_provider_models,
         reload_config,
+        list_mcp_servers,
         create_run,
         get_run,
         cancel_run,

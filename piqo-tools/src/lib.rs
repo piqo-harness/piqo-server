@@ -1,11 +1,17 @@
 //! Permission-gated native tools and MCP client integration.
 
 use std::{
+    collections::BTreeMap,
+    env,
     ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
     process::Stdio,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -13,7 +19,12 @@ use piqo_core::{PermissionDecision, PermissionPolicy, ToolRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
-use tokio::{io::AsyncReadExt, process::Command};
+use tokio::{
+    io::AsyncReadExt,
+    process::Command,
+    sync::{Mutex, RwLock},
+    time::timeout,
+};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -35,10 +46,46 @@ impl ToolRuntime {
 
 /// Configuration for an MCP server launched as a child process over stdio.
 /// The actual rmcp client session is intentionally kept at this IO edge.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
     pub command: String,
+    #[serde(default)]
     pub args: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    #[serde(default = "default_startup_timeout")]
+    pub startup_timeout_seconds: u64,
+    #[serde(default = "default_call_timeout")]
+    pub call_timeout_seconds: u64,
+    #[serde(default = "default_result_limit")]
+    pub max_result_bytes: usize,
+    #[serde(default = "default_termination_grace")]
+    pub termination_grace_millis: u64,
+    #[serde(default = "default_restart_limit")]
+    pub max_restart_attempts: u8,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+fn default_startup_timeout() -> u64 {
+    10
+}
+fn default_call_timeout() -> u64 {
+    30
+}
+fn default_result_limit() -> usize {
+    50 * 1024
+}
+fn default_termination_grace() -> u64 {
+    1_000
+}
+fn default_restart_limit() -> u8 {
+    3
 }
 
 impl McpServerConfig {
@@ -49,8 +96,443 @@ impl McpServerConfig {
         Self {
             command: command.into(),
             args: args.into_iter().map(Into::into).collect(),
+            cwd: None,
+            enabled: true,
+            environment: BTreeMap::new(),
+            startup_timeout_seconds: default_startup_timeout(),
+            call_timeout_seconds: default_call_timeout(),
+            max_result_bytes: default_result_limit(),
+            termination_grace_millis: default_termination_grace(),
+            max_restart_attempts: default_restart_limit(),
         }
     }
+
+    pub fn validate(&self) -> Result<(), McpError> {
+        if self.command.trim().is_empty()
+            || self.startup_timeout_seconds == 0
+            || self.call_timeout_seconds == 0
+            || self.max_result_bytes == 0
+            || self.termination_grace_millis == 0
+            || self.cwd.as_ref().is_some_and(|path| !path.is_absolute())
+            || self.environment.iter().any(|(child, host)| {
+                child.is_empty() || host.is_empty() || child.contains('=') || host.contains('=')
+            })
+        {
+            return Err(McpError::InvalidConfiguration);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpServerState {
+    Starting,
+    Healthy,
+    Failed,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct McpToolDefinition {
+    pub name: String,
+    pub server_id: String,
+    pub server_tool_name: String,
+    pub description: Option<String>,
+    pub input_schema: Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct McpServerDiagnostics {
+    pub id: String,
+    pub enabled: bool,
+    pub state: McpServerState,
+    pub tools: Vec<McpToolDefinition>,
+    pub last_error: Option<String>,
+    pub restart_attempts: u8,
+}
+
+#[derive(Debug, Error)]
+pub enum McpError {
+    #[error("invalid MCP configuration")]
+    InvalidConfiguration,
+    #[error("MCP server is unavailable")]
+    Unavailable,
+    #[error("MCP tool is unavailable")]
+    ToolNotFound,
+    #[error("MCP tool arguments are invalid")]
+    InvalidArguments,
+    #[error("MCP call result exceeded the configured limit")]
+    ResultTooLarge,
+    #[error("MCP execution outcome is uncertain")]
+    Uncertain,
+}
+
+#[derive(Clone)]
+struct McpClientHandler {
+    catalog_dirty: Arc<AtomicBool>,
+}
+
+impl rmcp::ClientHandler for McpClientHandler {
+    fn on_tool_list_changed(
+        &self,
+        _context: rmcp::service::NotificationContext<rmcp::RoleClient>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        self.catalog_dirty.store(true, Ordering::Release);
+        std::future::ready(())
+    }
+}
+
+type McpService = rmcp::service::RunningService<rmcp::RoleClient, McpClientHandler>;
+
+struct McpConnection {
+    service: McpService,
+    child: Mutex<tokio::process::Child>,
+    config: McpServerConfig,
+}
+
+struct McpEntry {
+    id: String,
+    config: McpServerConfig,
+    state: RwLock<McpServerState>,
+    tools: RwLock<Vec<McpToolDefinition>>,
+    last_error: RwLock<Option<String>>,
+    restart_attempts: Mutex<u8>,
+    connection: Mutex<Option<Arc<McpConnection>>>,
+    catalog_dirty: Arc<AtomicBool>,
+}
+
+/// Supervises configured stdio MCP servers. Configuration is trusted local
+/// policy; discovered metadata and all subprocess output are treated as
+/// untrusted and are never logged verbatim.
+#[derive(Clone, Default)]
+pub struct McpManager {
+    entries: Arc<Mutex<BTreeMap<String, Arc<McpEntry>>>>,
+}
+
+impl McpManager {
+    pub fn new(configs: BTreeMap<String, McpServerConfig>) -> Result<Self, McpError> {
+        for config in configs.values() {
+            config.validate()?;
+        }
+        let entries = configs
+            .into_iter()
+            .map(|(id, config)| {
+                (
+                    id.clone(),
+                    Arc::new(McpEntry {
+                        id: id.clone(),
+                        config,
+                        state: RwLock::new(McpServerState::Stopped),
+                        tools: RwLock::new(Vec::new()),
+                        last_error: RwLock::new(None),
+                        restart_attempts: Mutex::new(0),
+                        connection: Mutex::new(None),
+                        catalog_dirty: Arc::new(AtomicBool::new(false)),
+                    }),
+                )
+            })
+            .collect();
+        Ok(Self {
+            entries: Arc::new(Mutex::new(entries)),
+        })
+    }
+
+    pub async fn reconcile(
+        &self,
+        configs: BTreeMap<String, McpServerConfig>,
+    ) -> Result<(), McpError> {
+        let replacement = Self::new(configs)?;
+        let previous = {
+            let mut entries = self.entries.lock().await;
+            std::mem::replace(&mut *entries, replacement.entries.lock().await.clone())
+        };
+        for entry in previous.into_values() {
+            Self::stop_entry(&entry).await;
+        }
+        self.start_enabled().await;
+        Ok(())
+    }
+
+    /// Eagerly attempts each enabled server once. A failed child is observable
+    /// in diagnostics but does not invalidate the otherwise valid config.
+    pub async fn start_enabled(&self) {
+        let entries = self
+            .entries
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for entry in entries.into_iter().filter(|entry| entry.config.enabled) {
+            let _ = Self::ensure_entry(entry).await;
+        }
+    }
+
+    pub async fn diagnostics(&self) -> Vec<McpServerDiagnostics> {
+        let entries = self.entries.lock().await.clone();
+        let mut diagnostics = Vec::with_capacity(entries.len());
+        for (id, entry) in entries {
+            diagnostics.push(McpServerDiagnostics {
+                id,
+                enabled: entry.config.enabled,
+                state: *entry.state.read().await,
+                tools: entry.tools.read().await.clone(),
+                last_error: entry.last_error.read().await.clone(),
+                restart_attempts: *entry.restart_attempts.lock().await,
+            });
+        }
+        diagnostics
+    }
+
+    pub async fn catalog(&self) -> Vec<McpToolDefinition> {
+        self.start_enabled().await;
+        let entries = self
+            .entries
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut tools = entries;
+        tools.sort_by(|left, right| left.id.cmp(&right.id));
+        let mut catalog = Vec::new();
+        for entry in tools {
+            catalog.extend(entry.tools.read().await.clone());
+        }
+        let mut counts = BTreeMap::<String, usize>::new();
+        for tool in &catalog {
+            *counts.entry(tool.name.clone()).or_default() += 1;
+        }
+        catalog.retain(|tool| counts[&tool.name] == 1);
+        catalog.sort_by(|left, right| left.name.cmp(&right.name));
+        catalog
+    }
+
+    pub async fn call(
+        &self,
+        public_name: &str,
+        arguments: &Value,
+        cancellation: CancellationToken,
+    ) -> Result<Value, McpError> {
+        let entries = self.entries.lock().await.clone();
+        let Some((entry, definition)) = entries.values().find_map(|entry| {
+            entry.tools.try_read().ok().and_then(|tools| {
+                tools
+                    .iter()
+                    .find(|tool| tool.name == public_name)
+                    .cloned()
+                    .map(|tool| (entry.clone(), tool))
+            })
+        }) else {
+            return Err(McpError::ToolNotFound);
+        };
+        let connection = Self::ensure_entry(entry.clone()).await?;
+        let validator = jsonschema::validator_for(&definition.input_schema)
+            .map_err(|_| McpError::InvalidArguments)?;
+        if !validator.is_valid(arguments) || !arguments.is_object() {
+            return Err(McpError::InvalidArguments);
+        }
+        let params = rmcp::model::CallToolRequestParams::new(definition.server_tool_name)
+            .with_arguments(arguments.as_object().cloned().expect("validated object"));
+        let result = tokio::select! {
+            _ = cancellation.cancelled() => {
+                Self::stop_entry(&entry).await;
+                return Err(McpError::Uncertain);
+            },
+            result = timeout(Duration::from_secs(connection.config.call_timeout_seconds), connection.service.peer().call_tool_once(params)) => result,
+        };
+        let result = match result {
+            Ok(Ok(result)) => result,
+            _ => {
+                Self::stop_entry(&entry).await;
+                return Err(McpError::Uncertain);
+            }
+        };
+        let rmcp::model::CallToolResponse::Complete(result) = result else {
+            Self::stop_entry(&entry).await;
+            return Err(McpError::Uncertain);
+        };
+        let value = serde_json::to_value(result).map_err(|_| McpError::Uncertain)?;
+        if serde_json::to_vec(&value)
+            .map_err(|_| McpError::Uncertain)?
+            .len()
+            > connection.config.max_result_bytes
+        {
+            return Err(McpError::ResultTooLarge);
+        }
+        Ok(value)
+    }
+
+    pub async fn shutdown(&self) {
+        let entries = self
+            .entries
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for entry in entries {
+            Self::stop_entry(&entry).await;
+        }
+    }
+
+    async fn ensure_entry(entry: Arc<McpEntry>) -> Result<Arc<McpConnection>, McpError> {
+        if !entry.config.enabled {
+            return Err(McpError::Unavailable);
+        }
+        if let Some(connection) = entry.connection.lock().await.clone() {
+            if entry.catalog_dirty.swap(false, Ordering::AcqRel) {
+                Self::refresh_catalog(&entry, &connection).await?;
+            }
+            return Ok(connection);
+        }
+        let mut attempts = entry.restart_attempts.lock().await;
+        if *attempts >= entry.config.max_restart_attempts && *attempts != 0 {
+            return Err(McpError::Unavailable);
+        }
+        *entry.state.write().await = McpServerState::Starting;
+        let mut command = Command::new(&entry.config.command);
+        command
+            .args(&entry.config.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env_clear();
+        for key in ["PATH", "HOME", "TMPDIR", "TEMP", "TMP"] {
+            if let Some(value) = env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        for (child, host) in &entry.config.environment {
+            if let Some(value) = env::var_os(host) {
+                command.env(child, value);
+            }
+        }
+        if let Some(cwd) = &entry.config.cwd {
+            command.current_dir(cwd);
+        }
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(_) => return Self::fail(&entry, &mut attempts).await,
+        };
+        let stdout = child.stdout.take().ok_or(McpError::Unavailable)?;
+        let stdin = child.stdin.take().ok_or(McpError::Unavailable)?;
+        if let Some(mut stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 8192];
+                while stderr
+                    .read(&mut buffer)
+                    .await
+                    .ok()
+                    .filter(|count| *count > 0)
+                    .is_some()
+                {}
+            });
+        }
+        let service = match timeout(
+            Duration::from_secs(entry.config.startup_timeout_seconds),
+            rmcp::serve_client(
+                McpClientHandler {
+                    catalog_dirty: entry.catalog_dirty.clone(),
+                },
+                (stdout, stdin),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(service)) => service,
+            _ => {
+                let _ = child.start_kill();
+                return Self::fail(&entry, &mut attempts).await;
+            }
+        };
+        let connection = Arc::new(McpConnection {
+            service,
+            child: Mutex::new(child),
+            config: entry.config.clone(),
+        });
+        if Self::refresh_catalog(&entry, &connection).await.is_err() {
+            Self::stop_connection(&connection).await;
+            return Self::fail(&entry, &mut attempts).await;
+        }
+        *entry.last_error.write().await = None;
+        *entry.state.write().await = McpServerState::Healthy;
+        *entry.connection.lock().await = Some(connection.clone());
+        *attempts = 0;
+        Ok(connection)
+    }
+
+    async fn fail<T>(entry: &Arc<McpEntry>, attempts: &mut u8) -> Result<T, McpError> {
+        *attempts = attempts.saturating_add(1);
+        *entry.state.write().await = McpServerState::Failed;
+        *entry.last_error.write().await =
+            Some("MCP server startup, handshake, or discovery failed".to_owned());
+        Err(McpError::Unavailable)
+    }
+
+    async fn refresh_catalog(
+        entry: &Arc<McpEntry>,
+        connection: &Arc<McpConnection>,
+    ) -> Result<(), McpError> {
+        let discovered = connection
+            .service
+            .peer()
+            .list_all_tools()
+            .await
+            .map_err(|_| McpError::Unavailable)?;
+        *entry.tools.write().await = compile_catalog(&entry.id, discovered);
+        Ok(())
+    }
+
+    async fn stop_entry(entry: &Arc<McpEntry>) {
+        if let Some(connection) = entry.connection.lock().await.take() {
+            Self::stop_connection(&connection).await;
+        }
+        *entry.state.write().await = McpServerState::Stopped;
+    }
+
+    async fn stop_connection(connection: &Arc<McpConnection>) {
+        connection.service.cancellation_token().cancel();
+        let mut child = connection.child.lock().await;
+        let _ = child.start_kill();
+        let _ = timeout(
+            Duration::from_millis(connection.config.termination_grace_millis),
+            child.wait(),
+        )
+        .await;
+    }
+}
+
+fn compile_catalog(server_id: &str, tools: Vec<rmcp::model::Tool>) -> Vec<McpToolDefinition> {
+    let mut output = Vec::new();
+    for tool in tools {
+        let public_name = format!("mcp__{server_id}__{}", tool.name);
+        if public_name.len() > 64
+            || !public_name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            continue;
+        }
+        let schema = Value::Object((*tool.input_schema).clone());
+        if jsonschema::validator_for(&schema).is_err() {
+            continue;
+        }
+        output.push(McpToolDefinition {
+            name: public_name,
+            server_id: server_id.to_owned(),
+            server_tool_name: tool.name.into_owned(),
+            description: tool.description.map(|value| value.into_owned()),
+            input_schema: schema,
+        });
+    }
+    let mut counts = BTreeMap::<String, usize>::new();
+    for tool in &output {
+        *counts.entry(tool.name.clone()).or_default() += 1;
+    }
+    output.retain(|tool| counts[&tool.name] == 1);
+    output
 }
 
 /// Native tools implemented by Piqo itself.
@@ -870,7 +1352,17 @@ mod tests {
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
 
-    use super::{NativeExecutor, NativeTool, NativeToolLimits, ShellProgram};
+    use super::{McpServerConfig, NativeExecutor, NativeTool, NativeToolLimits, ShellProgram};
+
+    #[test]
+    fn mcp_configuration_uses_bounded_safe_defaults() {
+        let config = McpServerConfig::new("fixture", ["--stdio"]);
+        assert!(config.enabled);
+        assert_eq!(config.startup_timeout_seconds, 10);
+        assert_eq!(config.call_timeout_seconds, 30);
+        assert_eq!(config.max_result_bytes, 50 * 1024);
+        assert!(config.validate().is_ok());
+    }
 
     fn executor(root: &std::path::Path) -> NativeExecutor {
         NativeExecutor::new(

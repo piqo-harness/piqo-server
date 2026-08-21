@@ -134,6 +134,7 @@ impl PreparedServer {
         } = self;
         let lifecycle = state.lifecycle();
         let supervisor = state.supervisor().clone();
+        let mcp = state.mcp().clone();
         let server_shutdown = shutdown.clone();
         let cleanup_shutdown = shutdown.clone();
         let mut server = Box::pin(
@@ -146,7 +147,7 @@ impl PreparedServer {
             lifecycle.begin_shutdown();
             discovery_task.abort();
             let _ = discovery_task.await;
-            let result = supervisor.shutdown(shutdown_timeout).await;
+            let (result, _) = tokio::join!(supervisor.shutdown(shutdown_timeout), mcp.shutdown());
             lifecycle.close_streams();
             result
         });
@@ -208,8 +209,9 @@ pub async fn prepare_server(options: ServerOptions) -> Result<PreparedServer, Se
         .supervisor()
         .resume_ready_actions_after_restart()
         .await?;
+    let mcp = state.mcp().clone();
     let discovery_task = tokio::spawn(async move {
-        config.discover_all().await;
+        tokio::join!(config.discover_all(), mcp.start_enabled());
     });
     let router = router_with_token(state.clone(), options.auth_token);
     Ok(PreparedServer {
