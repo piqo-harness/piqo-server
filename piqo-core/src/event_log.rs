@@ -91,12 +91,20 @@ pub enum SemanticEvent {
     QueuePaused,
     QueueResumed,
     ToolCallEmitted {
+        #[serde(default)]
+        run_id: String,
+        #[serde(default)]
+        assistant_message_id: String,
         call_id: String,
         agent_id: String,
         tool_name: String,
         arguments: Value,
+        #[serde(default)]
+        raw_arguments: String,
     },
     ToolResult {
+        #[serde(default)]
+        run_id: String,
         call_id: String,
         agent_id: String,
         tool_name: String,

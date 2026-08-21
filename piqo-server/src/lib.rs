@@ -248,6 +248,11 @@ pub struct CreateSessionRequest {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+pub struct SubmitToolResultRequest {
+    pub result: Value,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateProjectRequest {
     pub name: String,
     pub path: String,
@@ -684,6 +689,26 @@ impl IntoResponse for ApiError {
                 "run_not_found",
                 format!("run {id} was not found"),
             ),
+            Self::Store(StoreError::ToolCallNotFound(id)) => (
+                StatusCode::NOT_FOUND,
+                "tool_call_not_found",
+                format!("tool call {id} was not found"),
+            ),
+            Self::Store(StoreError::ToolCallWrongRun { call_id, run_id }) => (
+                StatusCode::CONFLICT,
+                "tool_call_wrong_run",
+                format!("tool call {call_id} does not belong to run {run_id}"),
+            ),
+            Self::Store(StoreError::ToolResultConflict(id)) => (
+                StatusCode::CONFLICT,
+                "tool_result_conflict",
+                format!("tool result for {id} conflicts with the recorded result"),
+            ),
+            Self::Store(StoreError::CallerOwnedTranscript) => (
+                StatusCode::CONFLICT,
+                "caller_owned_transcript",
+                "tool results cannot be submitted when body owns messages or input".to_owned(),
+            ),
             Self::Store(StoreError::ProviderNotFound(name)) => (
                 StatusCode::NOT_FOUND,
                 "provider_not_found",
@@ -776,6 +801,10 @@ pub fn router_with_token(state: AppState, token: Option<String>) -> Router {
         .route(
             "/api/v1/sessions/{session_id}/runs/{run_id}/retries",
             post(retry_run),
+        )
+        .route(
+            "/api/v1/sessions/{session_id}/runs/{run_id}/tool_calls/{call_id}/result",
+            post(submit_tool_result),
         )
         .route(
             "/api/v1/sessions/{session_id}/queue/resume",
@@ -1549,6 +1578,25 @@ async fn retry_run(
             stream_url: format!("/api/v1/sessions/{session_id}/events/stream"),
         }),
     ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/sessions/{session_id}/runs/{run_id}/tool_calls/{call_id}/result",
+    params(("session_id" = String, Path), ("run_id" = String, Path), ("call_id" = String, Path)),
+    request_body = SubmitToolResultRequest,
+    responses((status = 202), (status = 404, body = ErrorResponse), (status = 409, body = ErrorResponse))
+)]
+async fn submit_tool_result(
+    State(state): State<AppState>,
+    ApiPath((session_id, run_id, call_id)): ApiPath<(String, String, String)>,
+    ApiJson(request): ApiJson<SubmitToolResultRequest>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .supervisor()
+        .submit_tool_result(&session_id, &run_id, &call_id, request.result)
+        .await?;
+    Ok(StatusCode::ACCEPTED)
 }
 
 #[utoipa::path(

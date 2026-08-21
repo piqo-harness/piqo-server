@@ -91,6 +91,19 @@ pub struct RunProjection {
     pub attempts: u32,
     pub error: Option<String>,
     pub queue_priority: i64,
+    #[serde(default)]
+    pub tool_calls: BTreeMap<String, ToolCallProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCallProjection {
+    pub call_id: String,
+    pub assistant_message_id: String,
+    pub agent_id: String,
+    pub tool_name: String,
+    pub arguments: serde_json::Value,
+    pub raw_arguments: String,
+    pub result: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -349,6 +362,7 @@ impl SessionProjection {
                         attempts: 0,
                         error: None,
                         queue_priority: if retry_of.is_some() { -1 } else { 0 },
+                        tool_calls: BTreeMap::new(),
                     },
                 );
             }
@@ -361,7 +375,7 @@ impl SessionProjection {
                     .runs
                     .get_mut(run_id)
                     .ok_or_else(|| ProjectionError::UnknownRun(run_id.clone()))?;
-                if run.status != RunStatus::Queued {
+                if !matches!(run.status, RunStatus::Queued | RunStatus::RequiresAction) {
                     return Err(ProjectionError::InvalidRunTransition {
                         run_id: run_id.clone(),
                         from: run.status,
@@ -371,6 +385,7 @@ impl SessionProjection {
                 run.status = RunStatus::Running;
                 run.attempt_id = Some(attempt_id.clone());
                 run.attempts = *attempt;
+                self.queue_paused = false;
             }
             crate::SemanticEvent::RunCompleted { run_id, .. } => {
                 self.set_run_terminal(run_id, RunStatus::Completed, None)?;
@@ -420,6 +435,55 @@ impl SessionProjection {
                 }
                 run.status = RunStatus::RequiresAction;
                 self.queue_paused = true;
+            }
+            crate::SemanticEvent::ToolCallEmitted {
+                run_id,
+                assistant_message_id,
+                call_id,
+                agent_id,
+                tool_name,
+                arguments,
+                raw_arguments,
+            } => {
+                let run = self
+                    .runs
+                    .get_mut(run_id)
+                    .ok_or_else(|| ProjectionError::UnknownRun(run_id.clone()))?;
+                if run.tool_calls.contains_key(call_id) {
+                    return Err(ProjectionError::DuplicateToolCall(call_id.clone()));
+                }
+                run.tool_calls.insert(
+                    call_id.clone(),
+                    ToolCallProjection {
+                        call_id: call_id.clone(),
+                        assistant_message_id: assistant_message_id.clone(),
+                        agent_id: agent_id.clone(),
+                        tool_name: tool_name.clone(),
+                        arguments: arguments.clone(),
+                        raw_arguments: raw_arguments.clone(),
+                        result: None,
+                    },
+                );
+            }
+            crate::SemanticEvent::ToolResult {
+                run_id,
+                call_id,
+                result,
+                ..
+            } => {
+                let run = self
+                    .runs
+                    .get_mut(run_id)
+                    .ok_or_else(|| ProjectionError::UnknownRun(run_id.clone()))?;
+                let call = run
+                    .tool_calls
+                    .get_mut(call_id)
+                    .ok_or_else(|| ProjectionError::UnknownToolCall(call_id.clone()))?;
+                match &call.result {
+                    None => call.result = Some(result.clone()),
+                    Some(existing) if existing == result => {}
+                    Some(_) => return Err(ProjectionError::ConflictingToolResult(call_id.clone())),
+                }
             }
             crate::SemanticEvent::RunAttemptFailed { run_id, error, .. } => {
                 let run = self
@@ -480,6 +544,14 @@ impl SessionProjection {
         });
         runs.into_iter()
     }
+
+    pub fn ready_action_run(&self) -> Option<&RunProjection> {
+        self.runs.values().find(|run| {
+            run.status == RunStatus::RequiresAction
+                && !run.tool_calls.is_empty()
+                && run.tool_calls.values().all(|call| call.result.is_some())
+        })
+    }
 }
 
 fn allowed_sources(next: SessionPhase) -> &'static [SessionPhase] {
@@ -518,6 +590,12 @@ pub enum ProjectionError {
     DuplicateMessage(String),
     #[error("message {0} is unknown")]
     UnknownMessage(String),
+    #[error("tool call {0} was emitted more than once")]
+    DuplicateToolCall(String),
+    #[error("tool call {0} is unknown")]
+    UnknownToolCall(String),
+    #[error("tool call {0} already has a different result")]
+    ConflictingToolResult(String),
     #[error("message {0} is already closed")]
     MessageAlreadyClosed(String),
     #[error("agent {0} was spawned more than once")]
@@ -634,5 +712,84 @@ mod tests {
                 .map(|run| run.run_id.as_str()),
             Some("retry")
         );
+    }
+
+    #[test]
+    fn projects_tool_results_idempotently_and_detects_conflicts() {
+        let mut projection = SessionProjection::new("s");
+        projection
+            .apply(1, &crate::SemanticEvent::SessionCreated { title: None })
+            .expect("creation projects");
+        projection
+            .apply(
+                2,
+                &crate::SemanticEvent::RunQueued {
+                    run_id: "r".into(),
+                    retry_of: None,
+                    provider: "p".into(),
+                    model: "m".into(),
+                    request: serde_json::json!({}),
+                },
+            )
+            .expect("run queues");
+        projection
+            .apply(
+                3,
+                &crate::SemanticEvent::RunStarted {
+                    run_id: "r".into(),
+                    attempt_id: "a".into(),
+                    attempt: 1,
+                },
+            )
+            .expect("run starts");
+        projection
+            .apply(
+                4,
+                &crate::SemanticEvent::ToolCallEmitted {
+                    run_id: "r".into(),
+                    assistant_message_id: "m".into(),
+                    call_id: "c".into(),
+                    agent_id: "assistant".into(),
+                    tool_name: "lookup".into(),
+                    arguments: serde_json::json!({"q":"x"}),
+                    raw_arguments: "{\"q\":\"x\"}".into(),
+                },
+            )
+            .expect("call emits");
+        projection
+            .apply(
+                5,
+                &crate::SemanticEvent::RunRequiresAction {
+                    run_id: "r".into(),
+                    call_ids: vec!["c".into()],
+                },
+            )
+            .expect("run pauses");
+        let result = crate::SemanticEvent::ToolResult {
+            run_id: "r".into(),
+            call_id: "c".into(),
+            agent_id: "assistant".into(),
+            tool_name: "lookup".into(),
+            result: serde_json::json!({"answer": 1}),
+        };
+        projection.apply(6, &result).expect("result projects");
+        projection
+            .apply(7, &result)
+            .expect("same result is idempotent");
+        assert_eq!(
+            projection.ready_action_run().map(|run| run.run_id.as_str()),
+            Some("r")
+        );
+        let conflict = crate::SemanticEvent::ToolResult {
+            run_id: "r".into(),
+            call_id: "c".into(),
+            agent_id: "assistant".into(),
+            tool_name: "lookup".into(),
+            result: serde_json::json!({"answer": 2}),
+        };
+        assert!(matches!(
+            projection.apply(8, &conflict),
+            Err(ProjectionError::ConflictingToolResult(_))
+        ));
     }
 }

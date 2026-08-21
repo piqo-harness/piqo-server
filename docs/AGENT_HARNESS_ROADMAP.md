@@ -91,7 +91,7 @@ changes state; detailed task tracking belongs in an issue or pull request.
 
 | Milestone | State | Tracking issue/PR | Last updated | Notes |
 | --- | --- | --- | --- | --- |
-| M1 | not_started | — | — | — |
+| M1 | implementing | — | 2026-08-20 | Action-result continuation in progress. |
 | M2 | not_started | — | — | — |
 | M3 | not_started | — | — | — |
 | M4 | not_started | — | — | — |

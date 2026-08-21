@@ -40,8 +40,12 @@ Designed or partially implemented, but **not wired into the server yet**:
 - a TUI, desktop UI, or other interactive client.
 
 If a model emits a tool call today, piqo records it and changes the run to
-`requires_action`. There is currently no API for submitting the tool result and
-continuing that run. Text-only model conversations are the primary usable path.
+`requires_action`. Clients submit each result with
+`POST /api/v1/sessions/{session_id}/runs/{run_id}/tool_calls/{call_id}/result`
+and `{ "result": <any JSON value> }`; piqo resumes the same run after every
+call in the provider turn has a result. Tool execution and permission decisions
+remain client-owned and are not implemented by this endpoint. Runs created with
+caller-owned `body.messages` or `body.input` cannot be continued this way.
 
 Both server entry points are loopback-only. The dedicated sidecar additionally
 requires a per-process bearer token; `piqo-cli serve` remains the simple,
@@ -101,6 +105,9 @@ connect_timeout_seconds = 10
 
 [defaults.body]
 temperature = 0.7
+
+[defaults]
+max_model_turns = 32
 ```
 
 For a provider requiring a bearer token, reference an environment variable
