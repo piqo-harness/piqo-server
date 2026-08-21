@@ -487,7 +487,9 @@ SSE or `GET` rather than infer completion from `202`. Unknown calls return
 `409/tool_call_wrong_run`. Runs using caller-owned `body.messages` or
 `body.input` return `409/caller_owned_transcript`, because piqo cannot safely
 reconstruct that transcript. This endpoint does not grant a permission or
-execute a tool.
+execute a tool. A Piqo-native call (`read`, `write`, `edit`, or `bash`) is
+executed server-side after permission resolution and returns
+`409/native_tool_managed` from this endpoint.
 
 ## 5. Durable events and SSE
 
@@ -578,7 +580,8 @@ run_completed                   run_failed
 run_cancelled                   run_interrupted
 run_requires_action             queue_paused
 queue_resumed                   tool_call_emitted
-tool_result                     agent_phase_changed
+tool_execution_started          tool_result
+agent_phase_changed
 permission_requested            permission_resolved
 agent_spawned                   agent_finished
 ```
@@ -657,6 +660,28 @@ Durable approvals are inspectable through `GET /api/v1/permission-rules` and
 revocable using `DELETE /api/v1/permission-rules/{rule_id}`. Explicit configured
 denials are absolute; otherwise request, session, project, global interactive,
 configured, and default decisions apply in that precedence order.
+
+## Native tools
+
+Piqo adds native tools only when all of these conditions hold: the run belongs
+to a project-backed session, a named agent enables the relevant permission with
+`allow` or `ask`, and the caller did not supply `body.tools`. `edit` uses the
+`write` permission. Native calls are permission requests like all other tool
+calls, but their result is server-managed and durable.
+
+`read` accepts `filePath`, optional 1-based `offset`, and optional `limit`.
+`write` accepts `filePath`, `content`, and required `mode` (`create` or
+`overwrite`). `edit` accepts `filePath`, `oldString`, `newString`, and optional
+`replaceAll`; without `replaceAll`, the expected content must occur exactly
+once. `bash` accepts `command` and optional `cwd`.
+
+All paths are evaluated under the selected project root. Traversal and symbolic
+links are rejected. Reads, writes, stdout, stderr, and runtime are bounded by
+server configuration. Shells run without profiles in a controlled environment;
+provider credentials are not included. A `tool_execution_started` event records
+an execution identity before a side effect begins, so a restart never retries a
+native side effect whose completion is uncertain; that run is interrupted
+instead.
 
 ## 8. Minimum conformance tests
 

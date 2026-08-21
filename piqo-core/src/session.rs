@@ -105,6 +105,10 @@ pub struct ToolCallProjection {
     pub tool_name: String,
     pub arguments: serde_json::Value,
     pub raw_arguments: String,
+    #[serde(default)]
+    pub native: bool,
+    #[serde(default)]
+    pub execution_id: Option<String>,
     pub result: Option<serde_json::Value>,
 }
 
@@ -472,6 +476,7 @@ impl SessionProjection {
                 tool_name,
                 arguments,
                 raw_arguments,
+                native,
             } => {
                 let run = self
                     .runs
@@ -489,9 +494,35 @@ impl SessionProjection {
                         tool_name: tool_name.clone(),
                         arguments: arguments.clone(),
                         raw_arguments: raw_arguments.clone(),
+                        native: *native,
+                        execution_id: None,
                         result: None,
                     },
                 );
+            }
+            crate::SemanticEvent::ToolExecutionStarted {
+                run_id,
+                call_id,
+                execution_id,
+            } => {
+                let run = self
+                    .runs
+                    .get_mut(run_id)
+                    .ok_or_else(|| ProjectionError::UnknownRun(run_id.clone()))?;
+                let call = run
+                    .tool_calls
+                    .get_mut(call_id)
+                    .ok_or_else(|| ProjectionError::UnknownToolCall(call_id.clone()))?;
+                if !call.native {
+                    return Err(ProjectionError::ExternalToolExecution(call_id.clone()));
+                }
+                match &call.execution_id {
+                    None => call.execution_id = Some(execution_id.clone()),
+                    Some(existing) if existing == execution_id => {}
+                    Some(_) => {
+                        return Err(ProjectionError::ConflictingToolExecution(call_id.clone()))
+                    }
+                }
             }
             crate::SemanticEvent::ToolResult {
                 run_id,
@@ -630,6 +661,10 @@ pub enum ProjectionError {
     ConflictingPermissionResolution(String),
     #[error("tool call {0} already has a different result")]
     ConflictingToolResult(String),
+    #[error("external tool call {0} cannot be executed natively")]
+    ExternalToolExecution(String),
+    #[error("tool call {0} already has a different execution claim")]
+    ConflictingToolExecution(String),
     #[error("message {0} is already closed")]
     MessageAlreadyClosed(String),
     #[error("agent {0} was spawned more than once")]
@@ -787,6 +822,7 @@ mod tests {
                     tool_name: "lookup".into(),
                     arguments: serde_json::json!({"q":"x"}),
                     raw_arguments: "{\"q\":\"x\"}".into(),
+                    native: false,
                 },
             )
             .expect("call emits");

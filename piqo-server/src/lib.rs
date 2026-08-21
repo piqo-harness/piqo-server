@@ -726,6 +726,11 @@ impl IntoResponse for ApiError {
                 "tool_result_conflict",
                 format!("tool result for {id} conflicts with the recorded result"),
             ),
+            Self::Store(StoreError::NativeToolManaged(id)) => (
+                StatusCode::CONFLICT,
+                "native_tool_managed",
+                format!("native tool call {id} is executed by the server"),
+            ),
             Self::Store(StoreError::CallerOwnedTranscript) => (
                 StatusCode::CONFLICT,
                 "caller_owned_transcript",
