@@ -7,7 +7,8 @@ use std::{
 
 use futures_util::StreamExt;
 use piqo_core::{
-    ContentBlock, MessageRole, RecordedEvent, RunProjection, RunStatus, SemanticEvent, SessionPhase,
+    ContentBlock, MessageRole, PermissionDecision, PermissionDecisionSource, PermissionScope,
+    RecordedEvent, RunProjection, RunStatus, SemanticEvent, SessionPhase,
 };
 use piqo_provider::{merge_request_bodies, ProviderDelta, ProviderProtocol, ProviderTransport};
 use serde::{Deserialize, Serialize};
@@ -19,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    config::{ConfigManager, PiqoConfig, ResolvedProvider},
+    config::{ConfigManager, PermissionSetting, PiqoConfig, ResolvedProvider},
     storage::StoreError,
     SqliteStore,
 };
@@ -315,6 +316,20 @@ impl SessionSupervisor {
                 }
                 None => return Err(StoreError::ToolCallNotFound(call_id.to_owned())),
             };
+            let permission = projection.pending_permissions.values().find(|permission| {
+                permission.run_id == run_id && permission.call_id.as_deref() == Some(call_id)
+            });
+            match permission.and_then(|permission| permission.decision) {
+                Some(PermissionDecision::Allow) => {}
+                Some(PermissionDecision::Deny) => {
+                    return Err(StoreError::Conflict("tool permission was denied".into()))
+                }
+                _ => {
+                    return Err(StoreError::Conflict(
+                        "tool permission has not been approved".into(),
+                    ))
+                }
+            }
             if let Some(existing) = &call.result {
                 return if existing == &result {
                     Ok(false)
@@ -346,6 +361,151 @@ impl SessionSupervisor {
             self.spawn_worker(session_id.to_owned()).await;
         }
         outcome.map(|_| ())
+    }
+
+    pub async fn approve_permission(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        request_id: &str,
+        scope: PermissionScope,
+    ) -> Result<(), StoreError> {
+        self.resolve_permission(
+            session_id,
+            run_id,
+            request_id,
+            PermissionDecision::Allow,
+            Some(scope),
+        )
+        .await
+    }
+
+    pub async fn deny_permission(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        request_id: &str,
+    ) -> Result<(), StoreError> {
+        self.resolve_permission(
+            session_id,
+            run_id,
+            request_id,
+            PermissionDecision::Deny,
+            None,
+        )
+        .await
+    }
+
+    async fn resolve_permission(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        request_id: &str,
+        decision: PermissionDecision,
+        scope: Option<PermissionScope>,
+    ) -> Result<(), StoreError> {
+        if self.shutdown.is_cancelled() {
+            return Err(StoreError::ShuttingDown);
+        }
+        self.ensure_session_mutable(session_id).await?;
+        let projection = self.store.projection(session_id).await?;
+        let request = projection
+            .pending_permissions
+            .get(request_id)
+            .ok_or_else(|| StoreError::InvalidRequest("permission request was not found".into()))?;
+        if request.run_id != run_id {
+            return Err(StoreError::InvalidRequest(
+                "permission request does not belong to run".into(),
+            ));
+        }
+        if let Some(existing) = request.decision {
+            return if existing == decision {
+                Ok(())
+            } else {
+                Err(StoreError::Conflict(
+                    "permission resolution conflicts with the recorded decision".into(),
+                ))
+            };
+        }
+        if decision == PermissionDecision::Deny && scope.is_some() {
+            return Err(StoreError::InvalidPermissionScope);
+        }
+        let session = self.store.get_session(session_id).await?;
+        let rule = match scope {
+            Some(PermissionScope::Once) | None => None,
+            Some(PermissionScope::Session) => Some(
+                self.store
+                    .create_permission_rule(
+                        PermissionScope::Session,
+                        Some(session_id),
+                        None,
+                        &request.agent_id,
+                        &request.tool_name,
+                    )
+                    .await?,
+            ),
+            Some(PermissionScope::Project) => {
+                let project_id = session
+                    .project_id
+                    .as_deref()
+                    .ok_or(StoreError::InvalidPermissionScope)?;
+                Some(
+                    self.store
+                        .create_permission_rule(
+                            PermissionScope::Project,
+                            None,
+                            Some(project_id),
+                            &request.agent_id,
+                            &request.tool_name,
+                        )
+                        .await?,
+                )
+            }
+            Some(PermissionScope::Configuration) => Some(
+                self.store
+                    .create_permission_rule(
+                        PermissionScope::Configuration,
+                        None,
+                        None,
+                        &request.agent_id,
+                        &request.tool_name,
+                    )
+                    .await?,
+            ),
+        };
+        let mut events = vec![SemanticEvent::PermissionResolved {
+            request_id: request_id.to_owned(),
+            decision,
+            source: Some(PermissionDecisionSource::RequestApproval),
+            scope,
+            rule_id: rule.as_ref().map(|rule| rule.id.clone()),
+            reason: None,
+        }];
+        if decision == PermissionDecision::Deny {
+            let call_id = request.call_id.clone().ok_or_else(|| {
+                StoreError::InvalidRequest("permission request has no tool call".into())
+            })?;
+            events.push(SemanticEvent::ToolResult { run_id: run_id.to_owned(), call_id, agent_id: request.agent_id.clone(), tool_name: request.tool_name.clone(), result: json!({"error":{"code":"permission_denied","message":"tool invocation was denied by permission policy"}}) });
+        }
+        let refreshed = self.store.projection(session_id).await?;
+        let run = refreshed
+            .runs
+            .get(run_id)
+            .ok_or_else(|| StoreError::RunNotFound(run_id.to_owned()))?;
+        let resolving_call = request.call_id.as_deref();
+        if decision == PermissionDecision::Deny
+            && run
+                .tool_calls
+                .values()
+                .all(|call| call.result.is_some() || Some(call.call_id.as_str()) == resolving_call)
+        {
+            events.push(SemanticEvent::QueueResumed);
+        }
+        self.append_many(session_id, events).await?;
+        if decision == PermissionDecision::Deny {
+            self.spawn_worker(session_id.to_owned()).await;
+        }
+        Ok(())
     }
 
     pub async fn cancel(&self, session_id: &str, run_id: &str) -> Result<(), StoreError> {
@@ -1228,6 +1388,111 @@ impl SessionSupervisor {
         }
     }
 
+    async fn evaluate_tool_permissions(
+        &self,
+        session_id: &str,
+        run: &RunProjection,
+    ) -> Result<(), StoreError> {
+        let request: RunRequest =
+            serde_json::from_value(run.request.clone()).map_err(StoreError::Json)?;
+        let agent_id = request.agent.unwrap_or_else(|| "assistant".to_owned());
+        let configured = self.config.agent(&agent_id).ok();
+        let session = self.store.get_session(session_id).await?;
+        let projection = self.store.projection(session_id).await?;
+        let run = projection
+            .runs
+            .get(&run.run_id)
+            .ok_or_else(|| StoreError::RunNotFound(run.run_id.clone()))?;
+        let mut events = Vec::new();
+        let mut has_pending_approval = false;
+        for call in run.tool_calls.values().filter(|call| call.result.is_none()) {
+            let request_id = Uuid::now_v7().to_string();
+            let configured_decision =
+                configured
+                    .as_ref()
+                    .and_then(|agent| match call.tool_name.as_str() {
+                        "read" => agent.permissions.read,
+                        "write" => agent.permissions.write,
+                        "bash" => agent.permissions.bash,
+                        _ => None,
+                    });
+            let (decision, source, rule_id) =
+                if configured_decision == Some(PermissionSetting::Deny) {
+                    (
+                        PermissionDecision::Deny,
+                        PermissionDecisionSource::Configuration,
+                        None,
+                    )
+                } else if let Some(rule) = self
+                    .store
+                    .matching_permission_rule(
+                        session_id,
+                        session.project_id.as_deref(),
+                        &agent_id,
+                        &call.tool_name,
+                    )
+                    .await?
+                {
+                    let source = match rule.scope {
+                        PermissionScope::Session => PermissionDecisionSource::SessionRule,
+                        PermissionScope::Project => PermissionDecisionSource::ProjectRule,
+                        PermissionScope::Configuration => {
+                            PermissionDecisionSource::InteractiveConfiguration
+                        }
+                        PermissionScope::Once => PermissionDecisionSource::RequestApproval,
+                    };
+                    (PermissionDecision::Allow, source, Some(rule.id))
+                } else {
+                    match configured_decision {
+                        Some(PermissionSetting::Allow) => (
+                            PermissionDecision::Allow,
+                            PermissionDecisionSource::Configuration,
+                            None,
+                        ),
+                        Some(PermissionSetting::Ask) => {
+                            has_pending_approval = true;
+                            (
+                                PermissionDecision::Ask,
+                                PermissionDecisionSource::Configuration,
+                                None,
+                            )
+                        }
+                        _ => (
+                            PermissionDecision::Deny,
+                            PermissionDecisionSource::Default,
+                            None,
+                        ),
+                    }
+                };
+            events.push(SemanticEvent::PermissionRequested {
+                request_id: request_id.clone(),
+                run_id: run.run_id.clone(),
+                call_id: Some(call.call_id.clone()),
+                agent_id: agent_id.clone(),
+                tool_name: call.tool_name.clone(),
+                arguments: call.arguments.clone(),
+            });
+            if decision != PermissionDecision::Ask {
+                events.push(SemanticEvent::PermissionResolved {
+                    request_id,
+                    decision,
+                    source: Some(source),
+                    scope: None,
+                    rule_id,
+                    reason: None,
+                });
+                if decision == PermissionDecision::Deny {
+                    events.push(SemanticEvent::ToolResult { run_id: run.run_id.clone(), call_id: call.call_id.clone(), agent_id: call.agent_id.clone(), tool_name: call.tool_name.clone(), result: json!({"error":{"code":"permission_denied","message":"tool invocation was denied by permission policy"}}) });
+                }
+            }
+        }
+        if !has_pending_approval {
+            events.push(SemanticEvent::QueueResumed);
+        }
+        self.append_many(session_id, events).await?;
+        Ok(())
+    }
+
     async fn finish_run(
         &self,
         session_id: &str,
@@ -1261,7 +1526,10 @@ impl SessionSupervisor {
                         .await
                         .is_ok()
                     {
-                        ExecutionResult::RequiresAction
+                        match self.evaluate_tool_permissions(session_id, run).await {
+                            Ok(()) => ExecutionResult::RequiresAction,
+                            Err(error) => ExecutionResult::Failed(error.to_string(), false),
+                        }
                     } else {
                         ExecutionResult::Failed("unable to persist required action".into(), false)
                     }

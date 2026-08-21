@@ -636,6 +636,28 @@ The process handle, validated origin, token, and SSE tasks belong to the same
 state-machine instance. They MUST NOT be reused across launches. Each new
 `ready` line replaces the old origin and token.
 
+## Permission requests
+
+Every tool call is evaluated before a client may submit its result. A run emits
+`permission_requested` with the call, agent, tool and arguments; a resolution
+is recorded as `permission_resolved`. The latter includes the effective
+decision and may include its source, scope, rule ID, and a non-sensitive reason.
+Older events omit these additive fields.
+
+Clients use the following run-scoped commands:
+
+- `GET /api/v1/sessions/{session_id}/runs/{run_id}/permission_requests`
+- `POST .../permission_requests/{request_id}/approve` with a `scope` of
+  `once`, `session`, `project`, or `configuration`
+- `POST .../permission_requests/{request_id}/deny`
+
+An approval is required before `tool_calls/{call_id}/result` succeeds. Denial
+creates the synthetic tool result `{"error":{"code":"permission_denied"}}`.
+Durable approvals are inspectable through `GET /api/v1/permission-rules` and
+revocable using `DELETE /api/v1/permission-rules/{rule_id}`. Explicit configured
+denials are absolute; otherwise request, session, project, global interactive,
+configured, and default decisions apply in that precedence order.
+
 ## 8. Minimum conformance tests
 
 A generated client is not conforming until automated tests cover:
