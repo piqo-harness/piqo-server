@@ -469,10 +469,25 @@ POST /api/v1/sessions/{session_id}/runs/{run_id}/retries
 
 Success is `202` with a new `run_id`. The original ID remains immutable.
 
-If a tool call pauses the queue, `POST /api/v1/sessions/{session_id}/queue/resume`
-returns `202` when resumption is valid. API v1 does not yet expose a way to
-submit a tool result and continue a `requires_action` run. A client MUST surface
-that state; it MUST NOT invent a result or assume the run completed.
+If a tool call pauses the queue, submit one result per outstanding provider call:
+
+```http
+POST /api/v1/sessions/{session_id}/runs/{run_id}/tool_calls/{call_id}/result
+Content-Type: application/json
+
+{"result": {"arbitrary":"JSON"}}
+```
+
+Success is `202` with an empty body. The same result may be submitted again
+idempotently; a different result returns `409/tool_result_conflict`. Calls from
+one provider response may be completed in any order. When the final result is
+durable, piqo resumes the same run; clients MUST observe its progress through
+SSE or `GET` rather than infer completion from `202`. Unknown calls return
+`404/tool_call_not_found`; a call belonging to another run returns
+`409/tool_call_wrong_run`. Runs using caller-owned `body.messages` or
+`body.input` return `409/caller_owned_transcript`, because piqo cannot safely
+reconstruct that transcript. This endpoint does not grant a permission or
+execute a tool.
 
 ## 5. Durable events and SSE
 

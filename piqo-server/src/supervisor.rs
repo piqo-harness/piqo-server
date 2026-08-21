@@ -162,6 +162,21 @@ impl SessionSupervisor {
         Ok(())
     }
 
+    pub async fn resume_ready_actions_after_restart(&self) -> Result<(), StoreError> {
+        for session_id in self.store.session_ids().await? {
+            if self
+                .store
+                .projection(&session_id)
+                .await?
+                .ready_action_run()
+                .is_some()
+            {
+                self.spawn_worker(session_id).await;
+            }
+        }
+        Ok(())
+    }
+
     async fn interrupt_remaining_runs(&self, reason: &str) -> Result<(), StoreError> {
         let sessions = self.store.session_ids().await?;
         for session_id in sessions {
@@ -249,6 +264,88 @@ impl SessionSupervisor {
         self.append(session_id, SemanticEvent::QueueResumed).await?;
         self.spawn_worker(session_id.to_owned()).await;
         Ok(())
+    }
+
+    pub async fn submit_tool_result(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        call_id: &str,
+        result: Value,
+    ) -> Result<(), StoreError> {
+        if self.shutdown.is_cancelled() {
+            return Err(StoreError::ShuttingDown);
+        }
+        self.ensure_session_mutable(session_id).await?;
+        let lock = {
+            let mut locks = self.locks.lock().await;
+            locks
+                .entry(session_id.to_owned())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let guard = lock.lock().await;
+        let outcome = async {
+            let projection = self.store.projection(session_id).await?;
+            let run = projection
+                .runs
+                .get(run_id)
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_owned()))?;
+            if !matches!(run.status, RunStatus::RequiresAction) {
+                return Err(StoreError::Conflict(
+                    "run is not awaiting tool results".into(),
+                ));
+            }
+            let request: RunRequest =
+                serde_json::from_value(run.request.clone()).map_err(StoreError::Json)?;
+            if request.body.get("messages").is_some() || request.body.get("input").is_some() {
+                return Err(StoreError::CallerOwnedTranscript);
+            }
+            let call = match run.tool_calls.get(call_id) {
+                Some(call) => call,
+                None if projection
+                    .runs
+                    .values()
+                    .any(|other| other.tool_calls.contains_key(call_id)) =>
+                {
+                    return Err(StoreError::ToolCallWrongRun {
+                        call_id: call_id.to_owned(),
+                        run_id: run_id.to_owned(),
+                    });
+                }
+                None => return Err(StoreError::ToolCallNotFound(call_id.to_owned())),
+            };
+            if let Some(existing) = &call.result {
+                return if existing == &result {
+                    Ok(false)
+                } else {
+                    Err(StoreError::ToolResultConflict(call_id.to_owned()))
+                };
+            }
+            let all_ready = run
+                .tool_calls
+                .values()
+                .all(|candidate| candidate.call_id == call_id || candidate.result.is_some());
+            let mut events = vec![SemanticEvent::ToolResult {
+                run_id: run_id.to_owned(),
+                call_id: call_id.to_owned(),
+                agent_id: call.agent_id.clone(),
+                tool_name: call.tool_name.clone(),
+                result,
+            }];
+            if all_ready {
+                events.push(SemanticEvent::QueueResumed);
+            }
+            self.append_many(session_id, events).await?;
+            Ok(all_ready)
+        }
+        .await;
+        drop(guard);
+        self.release_session_lock(session_id, &lock).await;
+        if matches!(outcome, Ok(true)) {
+            self.spawn_worker(session_id.to_owned()).await;
+        }
+        outcome.map(|_| ())
     }
 
     pub async fn cancel(&self, session_id: &str, run_id: &str) -> Result<(), StoreError> {
@@ -435,7 +532,50 @@ impl SessionSupervisor {
                     return Ok(());
                 }
                 let projection = self.store.projection(session_id).await?;
-                if projection.queue_paused || projection.active_run().is_some() {
+                if projection.active_run().is_some() {
+                    return Ok(());
+                }
+                if let Some(run) = projection.ready_action_run().cloned() {
+                    let max_turns = self
+                        .config
+                        .snapshot()
+                        .map_err(|error| StoreError::ProviderUnavailable(error.to_string()))?
+                        .defaults
+                        .max_model_turns;
+                    if run.attempts >= max_turns {
+                        self.append(
+                            session_id,
+                            SemanticEvent::RunFailed {
+                                run_id: run.run_id.clone(),
+                                error: format!("maximum model turns ({max_turns}) exceeded"),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                    self.append(session_id, SemanticEvent::QueueResumed).await?;
+                    self.append(
+                        session_id,
+                        SemanticEvent::RunStarted {
+                            run_id: run.run_id.clone(),
+                            attempt_id: Uuid::now_v7().to_string(),
+                            attempt: run.attempts + 1,
+                        },
+                    )
+                    .await?;
+                    let token = CancellationToken::new();
+                    self.cancellations
+                        .lock()
+                        .await
+                        .insert(run.run_id.clone(), token.clone());
+                    let result = self
+                        .execute_run(session_id, &run, token, None, None, 0)
+                        .await;
+                    self.cancellations.lock().await.remove(&run.run_id);
+                    self.finish_run(session_id, &run, result).await?;
+                    continue;
+                }
+                if projection.queue_paused {
                     return Ok(());
                 }
                 let Some(mut run) = projection.queued_runs().next().cloned() else {
@@ -1056,23 +1196,18 @@ impl SessionSupervisor {
                 self.append(
                     session_id,
                     SemanticEvent::ToolCallEmitted {
+                        run_id: run_id.to_owned(),
+                        assistant_message_id: assistant_message_id.to_owned(),
                         call_id: call_id.clone(),
                         agent_id: "assistant".into(),
                         tool_name: name.unwrap_or_else(|| "function".into()),
                         arguments: serde_json::from_str(&arguments)
                             .unwrap_or_else(|_| json!({"raw": arguments})),
+                        raw_arguments: arguments,
                     },
                 )
                 .await?;
-                self.append(
-                    session_id,
-                    SemanticEvent::RunRequiresAction {
-                        run_id: run_id.to_owned(),
-                        call_ids: vec![call_id],
-                    },
-                )
-                .await?;
-                Ok(DeltaResult::RequiresAction)
+                Ok(DeltaResult::None)
             }
             ProviderDelta::ToolCallDelta { .. } => Err(StoreError::InvalidRequest(
                 "incomplete tool call reached persistence".into(),
@@ -1099,6 +1234,43 @@ impl SessionSupervisor {
         run: &RunProjection,
         result: ExecutionResult,
     ) -> Result<(), StoreError> {
+        let result = if matches!(result, ExecutionResult::Completed) {
+            match self.store.projection(session_id).await {
+                Ok(projection) => {
+                    let call_ids = projection
+                        .runs
+                        .get(&run.run_id)
+                        .map(|run| {
+                            run.tool_calls
+                                .values()
+                                .filter(|call| call.result.is_none())
+                                .map(|call| call.call_id.clone())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    if call_ids.is_empty() {
+                        result
+                    } else if self
+                        .append(
+                            session_id,
+                            SemanticEvent::RunRequiresAction {
+                                run_id: run.run_id.clone(),
+                                call_ids,
+                            },
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        ExecutionResult::RequiresAction
+                    } else {
+                        ExecutionResult::Failed("unable to persist required action".into(), false)
+                    }
+                }
+                Err(error) => ExecutionResult::Failed(error.to_string(), false),
+            }
+        } else {
+            result
+        };
         match result {
             ExecutionResult::CompletedWithUsage(usage) => {
                 let projection = self.store.projection(session_id).await?;
@@ -1165,7 +1337,20 @@ impl SessionSupervisor {
                 .await?;
             }
             ExecutionResult::RequiresAction => {
-                self.interrupt_message(session_id).await?;
+                let projection = self.store.projection(session_id).await?;
+                if let Some(message) = projection.messages.iter().rev().find(|message| {
+                    message.role == MessageRole::Assistant
+                        && !message.completed
+                        && !message.interrupted
+                }) {
+                    self.append(
+                        session_id,
+                        SemanticEvent::MessageCompleted {
+                            message_id: message.message_id.clone(),
+                        },
+                    )
+                    .await?;
+                }
                 self.append(
                     session_id,
                     SemanticEvent::SessionPhaseChanged {
@@ -1356,9 +1541,49 @@ fn build_body(
     }
     match protocol {
         ProviderProtocol::ChatCompletions => {
+            let completed_messages = projection
+                .messages
+                .iter()
+                .filter(|message| message.completed || message.interrupted)
+                .collect::<Vec<_>>();
+            let offset = transcript.len().saturating_sub(completed_messages.len());
+            for (index, message) in completed_messages.iter().enumerate() {
+                if message.role != MessageRole::Assistant {
+                    continue;
+                }
+                let calls = projection.runs.values().flat_map(|run| run.tool_calls.values())
+                    .filter(|call| call.assistant_message_id == message.message_id)
+                    .map(|call| json!({"id": call.call_id, "type": "function", "function": {"name": call.tool_name, "arguments": call.raw_arguments}}))
+                    .collect::<Vec<_>>();
+                if !calls.is_empty() {
+                    transcript[offset + index]
+                        .as_object_mut()
+                        .expect("transcript messages are objects")
+                        .insert("tool_calls".into(), Value::Array(calls));
+                }
+            }
+            for call in projection
+                .runs
+                .values()
+                .flat_map(|run| run.tool_calls.values())
+            {
+                if let Some(result) = &call.result {
+                    transcript.push(json!({"role": "tool", "tool_call_id": call.call_id, "content": result.to_string()}));
+                }
+            }
             object.entry("messages").or_insert(Value::Array(transcript));
         }
         ProviderProtocol::Responses => {
+            for call in projection
+                .runs
+                .values()
+                .flat_map(|run| run.tool_calls.values())
+            {
+                transcript.push(json!({"type": "function_call", "call_id": call.call_id, "name": call.tool_name, "arguments": call.raw_arguments}));
+                if let Some(result) = &call.result {
+                    transcript.push(json!({"type": "function_call_output", "call_id": call.call_id, "output": result}));
+                }
+            }
             object.entry("input").or_insert(Value::Array(transcript));
         }
     }

@@ -204,6 +204,10 @@ pub async fn prepare_server(options: ServerOptions) -> Result<PreparedServer, Se
         options.dump_requests,
         shutdown.clone(),
     );
+    state
+        .supervisor()
+        .resume_ready_actions_after_restart()
+        .await?;
     let discovery_task = tokio::spawn(async move {
         config.discover_all().await;
     });

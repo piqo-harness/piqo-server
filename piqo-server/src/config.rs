@@ -34,10 +34,25 @@ pub struct PiqoConfig {
     markdown_agents: HashMap<String, AgentDefinition>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct BodyLayer {
     #[serde(default)]
     pub body: Value,
+    #[serde(default = "default_max_model_turns")]
+    pub max_model_turns: u32,
+}
+
+impl Default for BodyLayer {
+    fn default() -> Self {
+        Self {
+            body: Value::Null,
+            max_model_turns: default_max_model_turns(),
+        }
+    }
+}
+
+fn default_max_model_turns() -> u32 {
+    32
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

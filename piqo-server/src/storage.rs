@@ -84,6 +84,14 @@ pub enum StoreError {
     QueueNotPaused,
     #[error("run {0} was not found")]
     RunNotFound(String),
+    #[error("tool call {0} was not found")]
+    ToolCallNotFound(String),
+    #[error("tool call {call_id} does not belong to run {run_id}")]
+    ToolCallWrongRun { call_id: String, run_id: String },
+    #[error("tool result for {0} conflicts with the recorded result")]
+    ToolResultConflict(String),
+    #[error("tool results cannot be submitted for a caller-owned transcript")]
+    CallerOwnedTranscript,
     #[error("provider {0} was not found")]
     ProviderNotFound(String),
     #[error("provider unavailable: {0}")]
