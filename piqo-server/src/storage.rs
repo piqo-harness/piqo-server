@@ -106,6 +106,8 @@ pub enum StoreError {
     CallerOwnedTranscript,
     #[error("native tool call {0} is executed by the server")]
     NativeToolManaged(String),
+    #[error("MCP tool call {0} is executed by the server")]
+    McpToolManaged(String),
     #[error("provider {0} was not found")]
     ProviderNotFound(String),
     #[error("provider unavailable: {0}")]

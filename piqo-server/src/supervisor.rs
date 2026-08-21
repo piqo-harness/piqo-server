@@ -11,7 +11,7 @@ use piqo_core::{
     RecordedEvent, RunProjection, RunStatus, SemanticEvent, SessionPhase,
 };
 use piqo_provider::{merge_request_bodies, ProviderDelta, ProviderProtocol, ProviderTransport};
-use piqo_tools::{NativeExecutor, NativeTool, ShellProgram};
+use piqo_tools::{McpManager, McpToolDefinition, NativeExecutor, NativeTool, ShellProgram};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, Mutex};
@@ -92,6 +92,7 @@ pub struct RunRequest {
 pub struct SessionSupervisor {
     store: SqliteStore,
     config: ConfigManager,
+    mcp: McpManager,
     transport: ProviderTransport,
     hub: EventHub,
     locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
@@ -110,19 +111,28 @@ impl SessionSupervisor {
         hub: EventHub,
         dump_dir: Option<PathBuf>,
     ) -> Self {
-        Self::with_dump_dir_and_shutdown(store, config, hub, dump_dir, CancellationToken::new())
+        Self::with_dump_dir_and_shutdown(
+            store,
+            config,
+            hub,
+            McpManager::default(),
+            dump_dir,
+            CancellationToken::new(),
+        )
     }
 
     pub(crate) fn with_dump_dir_and_shutdown(
         store: SqliteStore,
         config: ConfigManager,
         hub: EventHub,
+        mcp: McpManager,
         dump_dir: Option<PathBuf>,
         shutdown: CancellationToken,
     ) -> Self {
         Self {
             store,
             config,
+            mcp,
             transport: ProviderTransport::new(),
             hub,
             locks: Arc::new(Mutex::new(HashMap::new())),
@@ -338,7 +348,11 @@ impl SessionSupervisor {
                 None => return Err(StoreError::ToolCallNotFound(call_id.to_owned())),
             };
             if call.native {
-                return Err(StoreError::NativeToolManaged(call_id.to_owned()));
+                return if call.tool_name.starts_with("mcp__") {
+                    Err(StoreError::McpToolManaged(call_id.to_owned()))
+                } else {
+                    Err(StoreError::NativeToolManaged(call_id.to_owned()))
+                };
             }
             let permission = projection.pending_permissions.values().find(|permission| {
                 permission.run_id == run_id && permission.call_id.as_deref() == Some(call_id)
@@ -936,12 +950,18 @@ impl SessionSupervisor {
                     Ok(_) => Vec::new(),
                     Err(error) => return ExecutionResult::Failed(error.to_string(), false),
                 };
+                let mcp_tools = if request.body.get("tools").is_some() {
+                    Vec::new()
+                } else {
+                    configured_mcp_tools(&config, &request, self.mcp.catalog().await)
+                };
                 let body = match build_body(
                     &config,
                     &provider.protocol,
                     &request,
                     &projection,
                     &native_tools,
+                    &mcp_tools,
                 ) {
                     Ok(body) => body,
                     Err(error) => return ExecutionResult::Failed(error.to_string(), false),
@@ -1454,7 +1474,12 @@ impl SessionSupervisor {
                         "read" => agent.permissions.read,
                         "write" | "edit" => agent.permissions.write,
                         "bash" => agent.permissions.bash,
-                        _ => None,
+                        _ => agent
+                            .permissions
+                            .tools
+                            .get(&call.tool_name)
+                            .copied()
+                            .or(agent.permissions.mcp),
                     });
             let (decision, source, rule_id) =
                 if configured_decision == Some(PermissionSetting::Deny) {
@@ -1542,11 +1567,9 @@ impl SessionSupervisor {
         run_id: &str,
         tool_name: &str,
     ) -> Result<bool, StoreError> {
-        let Some(tool) = NativeTool::parse(tool_name) else {
-            return Ok(false);
-        };
+        let tool = NativeTool::parse(tool_name);
         let session = self.store.get_session(session_id).await?;
-        if session.project_id.is_none() {
+        if session.project_id.is_none() && tool.is_some() {
             return Ok(false);
         }
         let projection = self.store.projection(session_id).await?;
@@ -1562,10 +1585,26 @@ impl SessionSupervisor {
         let agent_id = request.agent.unwrap_or_else(|| "assistant".to_owned());
         let configured = self.config.agent(&agent_id).ok();
         let decision = configured.and_then(|agent| match tool {
-            NativeTool::Read => agent.permissions.read,
-            NativeTool::Write | NativeTool::Edit => agent.permissions.write,
-            NativeTool::Bash => agent.permissions.bash,
+            Some(NativeTool::Read) => agent.permissions.read,
+            Some(NativeTool::Write | NativeTool::Edit) => agent.permissions.write,
+            Some(NativeTool::Bash) => agent.permissions.bash,
+            None => agent
+                .permissions
+                .tools
+                .get(tool_name)
+                .copied()
+                .or(agent.permissions.mcp),
         });
+        if tool.is_none()
+            && !self
+                .mcp
+                .catalog()
+                .await
+                .iter()
+                .any(|candidate| candidate.name == tool_name)
+        {
+            return Ok(false);
+        }
         Ok(matches!(
             decision,
             Some(PermissionSetting::Allow | PermissionSetting::Ask)
@@ -1578,10 +1617,10 @@ impl SessionSupervisor {
         run_id: &str,
     ) -> Result<bool, StoreError> {
         let session = self.store.get_session(session_id).await?;
-        let Some(project_id) = session.project_id else {
-            return Ok(false);
+        let project = match session.project_id {
+            Some(project_id) => Some(self.store.get_project(&project_id).await?),
+            None => None,
         };
-        let project = self.store.get_project(&project_id).await?;
         loop {
             let projection = self.store.projection(session_id).await?;
             let run = projection
@@ -1600,8 +1639,7 @@ impl SessionSupervisor {
             }) else {
                 break;
             };
-            let tool = NativeTool::parse(&call.tool_name)
-                .ok_or_else(|| StoreError::InvalidRequest("unknown native tool".into()))?;
+            let tool = NativeTool::parse(&call.tool_name);
             let call_id = call.call_id.clone();
             let agent_id = call.agent_id.clone();
             let tool_name = call.tool_name.clone();
@@ -1615,18 +1653,6 @@ impl SessionSupervisor {
                 },
             )
             .await?;
-            let config = self
-                .config
-                .snapshot()
-                .map_err(|error| StoreError::ProviderUnavailable(error.to_string()))?;
-            let shell = ShellProgram::discover(config.native_tools.shell.as_deref())
-                .map_err(|error| StoreError::InvalidRequest(error.to_string()))?;
-            let executor = NativeExecutor::new(
-                PathBuf::from(&project.path),
-                config.native_tools.limits(),
-                shell,
-            )
-            .map_err(|error| StoreError::InvalidRequest(error.to_string()))?;
             let cancellation = self
                 .cancellations
                 .lock()
@@ -1634,7 +1660,37 @@ impl SessionSupervisor {
                 .get(run_id)
                 .cloned()
                 .unwrap_or_else(CancellationToken::new);
-            let result = executor.execute(tool, &arguments, cancellation).await;
+            let result = if let Some(tool) = tool {
+                let project = project.as_ref().ok_or_else(|| {
+                    StoreError::InvalidRequest(
+                        "native tools require a project-backed session".into(),
+                    )
+                })?;
+                let config = self
+                    .config
+                    .snapshot()
+                    .map_err(|error| StoreError::ProviderUnavailable(error.to_string()))?;
+                let shell = ShellProgram::discover(config.native_tools.shell.as_deref())
+                    .map_err(|error| StoreError::InvalidRequest(error.to_string()))?;
+                let executor = NativeExecutor::new(
+                    PathBuf::from(&project.path),
+                    config.native_tools.limits(),
+                    shell,
+                )
+                .map_err(|error| StoreError::InvalidRequest(error.to_string()))?;
+                executor.execute(tool, &arguments, cancellation).await
+            } else {
+                match self.mcp.call(&tool_name, &arguments, cancellation).await {
+                    Ok(result) => result,
+                    Err(piqo_tools::McpError::InvalidArguments) => {
+                        json!({"error":{"code":"invalid_tool_arguments"}})
+                    }
+                    Err(piqo_tools::McpError::ResultTooLarge) => {
+                        json!({"error":{"code":"mcp_result_too_large"}})
+                    }
+                    Err(_) => json!({"error":{"code":"mcp_execution_uncertain"}}),
+                }
+            };
             self.append(
                 session_id,
                 SemanticEvent::ToolResult {
@@ -1933,6 +1989,7 @@ fn build_body(
     request: &RunRequest,
     projection: &piqo_core::SessionProjection,
     native_tools: &[NativeTool],
+    mcp_tools: &[McpToolDefinition],
 ) -> Result<Value, StoreError> {
     let layers = config.body_layers(
         &request.model,
@@ -1949,8 +2006,9 @@ fn build_body(
         .entry("model")
         .or_insert_with(|| Value::String(request.model.clone()));
     object.entry("stream").or_insert(Value::Bool(true));
-    if !native_tools.is_empty() {
-        let definitions = native_tool_definitions(protocol, native_tools);
+    if !native_tools.is_empty() || !mcp_tools.is_empty() {
+        let mut definitions = native_tool_definitions(protocol, native_tools);
+        definitions.extend(mcp_tool_definitions(protocol, mcp_tools));
         object.entry("tools").or_insert(Value::Array(definitions));
     }
     let mut transcript = projection
@@ -2066,6 +2124,33 @@ fn configured_native_tools(config: &PiqoConfig, request: &RunRequest) -> Vec<Nat
     .collect()
 }
 
+fn configured_mcp_tools(
+    config: &PiqoConfig,
+    request: &RunRequest,
+    catalog: Vec<McpToolDefinition>,
+) -> Vec<McpToolDefinition> {
+    let Some(agent_name) = request.agent.as_deref() else {
+        return Vec::new();
+    };
+    let Ok(agent) = config.agent(agent_name) else {
+        return Vec::new();
+    };
+    catalog
+        .into_iter()
+        .filter(|tool| {
+            matches!(
+                agent
+                    .permissions
+                    .tools
+                    .get(&tool.name)
+                    .copied()
+                    .or(agent.permissions.mcp),
+                Some(PermissionSetting::Allow | PermissionSetting::Ask)
+            )
+        })
+        .collect()
+}
+
 fn native_tool_definitions(protocol: &ProviderProtocol, tools: &[NativeTool]) -> Vec<Value> {
     tools
         .iter()
@@ -2092,6 +2177,16 @@ fn native_tool_definitions(protocol: &ProviderProtocol, tools: &[NativeTool]) ->
                 ProviderProtocol::ChatCompletions => json!({"type":"function","function":{"name":tool.name(),"description":description,"parameters":parameters}}),
                 ProviderProtocol::Responses => json!({"type":"function","name":tool.name(),"description":description,"parameters":parameters}),
             }
+        })
+        .collect()
+}
+
+fn mcp_tool_definitions(protocol: &ProviderProtocol, tools: &[McpToolDefinition]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|tool| match protocol {
+            ProviderProtocol::ChatCompletions => json!({"type":"function","function":{"name":tool.name,"description":tool.description,"parameters":tool.input_schema}}),
+            ProviderProtocol::Responses => json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.input_schema}),
         })
         .collect()
 }
@@ -2227,6 +2322,7 @@ mod tests {
             store.clone(),
             manager.clone(),
             EventHub::new(),
+            McpManager::default(),
             None,
             CancellationToken::new(),
         );
@@ -2303,6 +2399,7 @@ mod tests {
             store.clone(),
             manager.clone(),
             EventHub::new(),
+            McpManager::default(),
             None,
             CancellationToken::new(),
         );
@@ -2382,6 +2479,7 @@ mod tests {
             &request,
             &projection,
             &[],
+            &[],
         )
         .expect("body builds");
         assert_eq!(body["messages"][0]["role"], "system");
@@ -2396,6 +2494,7 @@ mod tests {
             &ProviderProtocol::ChatCompletions,
             &request,
             &projection,
+            &[],
             &[],
         )
         .expect("body builds");
@@ -2435,6 +2534,7 @@ mod tests {
             &request,
             &piqo_core::SessionProjection::new("session"),
             &tools,
+            &[],
         )
         .expect("body builds");
         assert_eq!(body["tools"].as_array().unwrap().len(), 3);
@@ -2469,6 +2569,7 @@ mod tests {
             store.clone(),
             ConfigManager::memory(config),
             hub,
+            McpManager::default(),
             None,
             CancellationToken::new(),
         );
@@ -2635,6 +2736,7 @@ mod tests {
             store.clone(),
             ConfigManager::memory(config),
             hub,
+            McpManager::default(),
             None,
             CancellationToken::new(),
         );

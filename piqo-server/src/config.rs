@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     env,
     fs::{self, File, OpenOptions},
     io::Write,
@@ -11,7 +11,7 @@ use std::{
 
 use chrono::{SecondsFormat, Utc};
 use piqo_provider::{ProviderProtocol, ProviderTransport};
-use piqo_tools::NativeToolLimits;
+use piqo_tools::{McpServerConfig, NativeToolLimits};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -33,6 +33,8 @@ pub struct PiqoConfig {
     pub variants: HashMap<String, BodyLayer>,
     #[serde(default)]
     pub native_tools: NativeToolsConfig,
+    #[serde(default)]
+    pub mcp_servers: BTreeMap<String, McpServerConfig>,
     #[serde(skip)]
     markdown_agents: HashMap<String, AgentDefinition>,
 }
@@ -136,6 +138,9 @@ pub struct AgentPermissions {
     pub read: Option<PermissionSetting>,
     pub write: Option<PermissionSetting>,
     pub bash: Option<PermissionSetting>,
+    pub mcp: Option<PermissionSetting>,
+    #[serde(default)]
+    pub tools: BTreeMap<String, PermissionSetting>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
@@ -338,6 +343,8 @@ pub enum ConfigError {
     InvalidProvider(String),
     #[error("invalid native tool configuration: {0}")]
     InvalidNativeTools(String),
+    #[error("invalid MCP server configuration: {0}")]
+    InvalidMcp(String),
     #[error("configuration is read-only in this server instance")]
     ReadOnly,
     #[error("configuration state lock was poisoned")]
@@ -390,6 +397,16 @@ impl PiqoConfig {
             provider.validate(name)?;
         }
         self.native_tools.validate()?;
+        for (id, server) in &self.mcp_servers {
+            if !valid_agent_id(id) {
+                return Err(ConfigError::InvalidMcp(format!(
+                    "server id {id} must use letters, digits, underscores, or hyphens"
+                )));
+            }
+            server
+                .validate()
+                .map_err(|error| ConfigError::InvalidMcp(format!("{id}: {error}")))?;
+        }
         Ok(())
     }
 
@@ -568,6 +585,8 @@ fn merge_permissions(
     target.read = override_permissions.read.or(target.read);
     target.write = override_permissions.write.or(target.write);
     target.bash = override_permissions.bash.or(target.bash);
+    target.mcp = override_permissions.mcp.or(target.mcp);
+    target.tools.extend(override_permissions.tools.clone());
 }
 
 fn valid_agent_id(id: &str) -> bool {

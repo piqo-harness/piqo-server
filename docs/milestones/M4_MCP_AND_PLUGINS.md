@@ -1,6 +1,6 @@
 # M4 — MCP and Plugin Integration
 
-State: `not_started`
+State: `implementing`
 
 ## Outcome
 

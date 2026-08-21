@@ -382,6 +382,14 @@ response as the reload result and then follow the normal process-exit recovery
 flow. A missing credential environment variable is not a structural reload
 error; it is reported when the affected provider is used.
 
+Configured MCP servers are supervised local stdio children. `GET
+/api/v1/mcp/servers` returns enabled state, health, a sanitized last error, and
+the currently published tools without environment values. MCP tools announced
+by Piqo use `mcp__<server>__<tool>` names and are server-managed: submitting a
+client result for one returns `409/mcp_tool_managed`. A timeout or broken MCP
+transport is persisted as `mcp_execution_uncertain`; Piqo never retries that
+tool call automatically.
+
 ### 4.4 Agents
 
 `GET /api/v1/agents` returns resolved agent metadata without exposing their
