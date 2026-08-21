@@ -7,10 +7,14 @@ use std::{
 
 use futures_util::StreamExt;
 use piqo_core::{
-    ContentBlock, MessageRole, PermissionDecision, PermissionDecisionSource, PermissionScope,
-    RecordedEvent, RunProjection, RunStatus, SemanticEvent, SessionPhase,
+    estimate_tokens, CompactionStrategy, ContentBlock, ContextArtifact, MessageRole,
+    PermissionDecision, PermissionDecisionSource, PermissionScope, RecordedEvent, RunProjection,
+    RunStatus, SemanticEvent, SessionPhase, ToolCorrelation, CONTEXT_ESTIMATOR_VERSION,
 };
-use piqo_provider::{merge_request_bodies, ProviderDelta, ProviderProtocol, ProviderTransport};
+use piqo_provider::{
+    merge_request_bodies, parse_non_stream_response, ProviderDelta, ProviderProtocol,
+    ProviderTransport,
+};
 use piqo_tools::{McpManager, McpToolDefinition, NativeExecutor, NativeTool, ShellProgram};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -939,10 +943,6 @@ impl SessionSupervisor {
         let execution = match (execution, initial_config) {
             (Some(execution), None) => execution,
             (None, Some((config, provider))) => {
-                let projection = match self.store.projection(session_id).await {
-                    Ok(projection) => projection,
-                    Err(error) => return ExecutionResult::Failed(error.to_string(), false),
-                };
                 let native_tools = match self.store.get_session(session_id).await {
                     Ok(session) if session.project_id.is_some() => {
                         configured_native_tools(&config, &request)
@@ -955,14 +955,21 @@ impl SessionSupervisor {
                 } else {
                     configured_mcp_tools(&config, &request, self.mcp.catalog().await)
                 };
-                let body = match build_body(
-                    &config,
-                    &provider.protocol,
-                    &request,
-                    &projection,
-                    &native_tools,
-                    &mcp_tools,
-                ) {
+                let body = match self
+                    .build_compacted_body(
+                        session_id,
+                        &run.run_id,
+                        CompactionInputs {
+                            request: &request,
+                            config: &config,
+                            provider: &provider,
+                            native_tools: &native_tools,
+                            mcp_tools: &mcp_tools,
+                            cancellation: &cancellation,
+                        },
+                    )
+                    .await
+                {
                     Ok(body) => body,
                     Err(error) => return ExecutionResult::Failed(error.to_string(), false),
                 };
@@ -1380,6 +1387,324 @@ impl SessionSupervisor {
             ExecutionResult::Completed => ExecutionResult::CompletedWithUsage(usage),
             other => other,
         }
+    }
+
+    async fn build_compacted_body(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        inputs: CompactionInputs<'_>,
+    ) -> Result<Value, StoreError> {
+        let CompactionInputs {
+            request,
+            config,
+            provider,
+            native_tools,
+            mcp_tools,
+            cancellation,
+        } = inputs;
+        if request.body.get("messages").is_some() || request.body.get("input").is_some() {
+            self.append(
+                session_id,
+                SemanticEvent::ContextCompactionBypassed {
+                    run_id: run_id.to_owned(),
+                    reason: "caller_owned_transcript".to_owned(),
+                },
+            )
+            .await?;
+            let projection = self.store.projection(session_id).await?;
+            return build_body(
+                config,
+                &provider.protocol,
+                request,
+                &projection,
+                native_tools,
+                mcp_tools,
+            );
+        }
+        let projection = self.store.projection(session_id).await?;
+        let body = build_body(
+            config,
+            &provider.protocol,
+            request,
+            &projection,
+            native_tools,
+            mcp_tools,
+        )?;
+        let estimate = body_token_estimate(&body);
+        let budget = self
+            .config
+            .context_budget(&request.provider, &request.model)
+            .map_err(|error| StoreError::InvalidRequest(error.to_string()))?;
+        let input_budget = budget
+            .context_window_tokens
+            .checked_sub(budget.output_reserve_tokens)
+            .ok_or_else(|| StoreError::InvalidRequest("invalid context budget".to_owned()))?;
+        let trigger = (input_budget as f64 * config.context.trigger_ratio).ceil() as u64;
+        let target = (input_budget as f64 * config.context.target_ratio).floor() as u64;
+        if estimate < trigger {
+            return Ok(body);
+        }
+        let compactable = projection
+            .messages
+            .iter()
+            .filter(|message| message.completed || message.interrupted)
+            .filter(|message| {
+                projection
+                    .context
+                    .active_artifact
+                    .as_ref()
+                    .is_none_or(|artifact| message.last_event_id > artifact.source_end_event_id)
+            })
+            .collect::<Vec<_>>();
+        let keep = compactable.len().saturating_sub(4);
+        let selected = &compactable[..keep];
+        let Some(first) = selected.first() else {
+            self.append(
+                session_id,
+                SemanticEvent::ContextCompactionFailed {
+                    run_id: run_id.to_owned(),
+                    artifact_id: Uuid::now_v7().to_string(),
+                    code: "context_budget_exceeded".to_owned(),
+                },
+            )
+            .await?;
+            return Err(StoreError::InvalidRequest(
+                "context_budget_exceeded".to_owned(),
+            ));
+        };
+        let artifact_id = Uuid::now_v7().to_string();
+        let source_start_event_id = projection
+            .context
+            .active_artifact
+            .as_ref()
+            .map(|artifact| artifact.source_start_event_id)
+            .unwrap_or(first.first_event_id);
+        let source_end_event_id = selected
+            .last()
+            .map(|message| message.last_event_id)
+            .unwrap_or(first.last_event_id);
+        let strategy = match config.context.compaction.strategy {
+            crate::config::CompactionStrategyConfig::Deterministic => {
+                CompactionStrategy::Deterministic
+            }
+            crate::config::CompactionStrategyConfig::Llm => CompactionStrategy::Llm,
+        };
+        self.append(
+            session_id,
+            SemanticEvent::ContextCompactionStarted {
+                run_id: run_id.to_owned(),
+                artifact_id: artifact_id.clone(),
+                strategy,
+                source_start_event_id,
+                source_end_event_id,
+            },
+        )
+        .await?;
+        let summary = match strategy {
+            CompactionStrategy::Deterministic => deterministic_summary(selected),
+            CompactionStrategy::Llm => match self
+                .summarize_context(provider, request, config, selected, cancellation)
+                .await
+            {
+                Ok(summary) => summary,
+                Err(error) => {
+                    self.append(
+                        session_id,
+                        SemanticEvent::ContextCompactionFailed {
+                            run_id: run_id.to_owned(),
+                            artifact_id,
+                            code: "context_compaction_failed".to_owned(),
+                        },
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            },
+        };
+        let correlations = projection
+            .runs
+            .values()
+            .flat_map(|run| run.tool_calls.values().map(move |call| (run, call)))
+            .filter(|(_, call)| {
+                projection
+                    .messages
+                    .iter()
+                    .find(|message| message.message_id == call.assistant_message_id)
+                    .is_some_and(|message| message.last_event_id <= source_end_event_id)
+            })
+            .map(|(run, call)| ToolCorrelation {
+                call_id: call.call_id.clone(),
+                tool_name: call.tool_name.clone(),
+                run_id: run.run_id.clone(),
+            })
+            .collect();
+        let artifact = ContextArtifact {
+            artifact_id,
+            supersedes_artifact_id: projection
+                .context
+                .active_artifact
+                .as_ref()
+                .map(|artifact| artifact.artifact_id.clone()),
+            strategy,
+            strategy_version: 1,
+            source_start_event_id,
+            source_end_event_id,
+            context_window_tokens: budget.context_window_tokens,
+            output_reserve_tokens: budget.output_reserve_tokens,
+            estimated_input_tokens: estimate,
+            target_input_tokens: target,
+            estimator_version: CONTEXT_ESTIMATOR_VERSION.to_owned(),
+            summary,
+            tool_correlations: correlations,
+        };
+        let mut compacted_projection = projection.clone();
+        compacted_projection.context.active_artifact = Some(artifact.clone());
+        let compacted = build_body(
+            config,
+            &provider.protocol,
+            request,
+            &compacted_projection,
+            native_tools,
+            mcp_tools,
+        )?;
+        if body_token_estimate(&compacted) > input_budget {
+            self.append(
+                session_id,
+                SemanticEvent::ContextCompactionFailed {
+                    run_id: run_id.to_owned(),
+                    artifact_id: artifact.artifact_id,
+                    code: "context_budget_exceeded".to_owned(),
+                },
+            )
+            .await?;
+            return Err(StoreError::InvalidRequest(
+                "context_budget_exceeded".to_owned(),
+            ));
+        }
+        self.append(
+            session_id,
+            SemanticEvent::ContextCompacted {
+                run_id: run_id.to_owned(),
+                artifact,
+            },
+        )
+        .await?;
+        Ok(compacted)
+    }
+
+    async fn summarize_context(
+        &self,
+        provider: &ResolvedProvider,
+        request: &RunRequest,
+        config: &PiqoConfig,
+        selected: &[&piqo_core::MessageProjection],
+        cancellation: &CancellationToken,
+    ) -> Result<String, StoreError> {
+        let compacted = selected
+            .iter()
+            .map(|message| json!({"role": role_name(message.role), "content": message.blocks}))
+            .collect::<Vec<_>>();
+        let prompt = format!("Return JSON only: {{\"summary\":\"...\"}}. Summarize this closed conversation faithfully, retaining decisions, facts, and unfinished work: {}", Value::Array(compacted));
+        let mut body = config.context.compaction.summary_body.clone();
+        if body.is_null() {
+            body = json!({});
+        }
+        let object = body.as_object_mut().ok_or_else(|| {
+            StoreError::InvalidRequest(
+                "context compaction summary_body must be an object".to_owned(),
+            )
+        })?;
+        object.insert(
+            "model".to_owned(),
+            Value::String(
+                config
+                    .context
+                    .compaction
+                    .summary_model
+                    .clone()
+                    .unwrap_or_else(|| request.model.clone()),
+            ),
+        );
+        object.insert("stream".to_owned(), Value::Bool(false));
+        match provider.protocol {
+            ProviderProtocol::ChatCompletions => {
+                object.insert(
+                    "max_tokens".to_owned(),
+                    json!(config.context.compaction.summary_max_output_tokens),
+                );
+                object.insert(
+                    "messages".to_owned(),
+                    json!([{ "role": "user", "content": prompt }]),
+                );
+            }
+            ProviderProtocol::Responses => {
+                object.insert(
+                    "max_output_tokens".to_owned(),
+                    json!(config.context.compaction.summary_max_output_tokens),
+                );
+                object.insert(
+                    "input".to_owned(),
+                    json!([{ "role": "user", "content": prompt }]),
+                );
+            }
+        }
+        let summary_provider = config
+            .context
+            .compaction
+            .summary_provider
+            .as_deref()
+            .unwrap_or(&request.provider);
+        let resolved = if summary_provider == request.provider {
+            provider.clone()
+        } else {
+            self.config
+                .resolve_provider(summary_provider)
+                .map_err(|error| StoreError::ProviderUnavailable(error.to_string()))?
+        };
+        let request = self
+            .transport
+            .build_request_with_headers(&resolved.endpoint, body, &resolved.headers)
+            .map_err(|error| StoreError::InvalidRequest(error.to_string()))?;
+        for _ in 0..=config.context.compaction.max_retries {
+            let response = tokio::select! {
+                _ = cancellation.cancelled() => return Err(StoreError::InvalidRequest("context_compaction_cancelled".to_owned())),
+                response = self.transport.send_with_connect_timeout(request.try_clone().expect("JSON request is cloneable"), Duration::from_secs(resolved.connect_timeout_seconds)) => response,
+            }.map_err(|_| StoreError::InvalidRequest("context_compaction_failed".to_owned()))?;
+            if !response.status().is_success() {
+                continue;
+            }
+            let response = response
+                .text()
+                .await
+                .map_err(|_| StoreError::InvalidRequest("context_compaction_failed".to_owned()))?;
+            let text = parse_non_stream_response(resolved.protocol, &response)
+                .map_err(|_| StoreError::InvalidRequest("context_compaction_failed".to_owned()))?
+                .into_iter()
+                .filter_map(|delta| {
+                    if let ProviderDelta::Text(text) = delta {
+                        Some(text)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<String>();
+            if let Some(summary) = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("summary")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .filter(|summary| !summary.trim().is_empty())
+            {
+                return Ok(summary);
+            }
+        }
+        Err(StoreError::InvalidRequest(
+            "context_compaction_failed".to_owned(),
+        ))
     }
 
     async fn persist_delta(
@@ -1971,6 +2296,15 @@ struct RunExecutionConfig {
     body: Value,
 }
 
+struct CompactionInputs<'a> {
+    request: &'a RunRequest,
+    config: &'a PiqoConfig,
+    provider: &'a ResolvedProvider,
+    native_tools: &'a [NativeTool],
+    mcp_tools: &'a [McpToolDefinition],
+    cancellation: &'a CancellationToken,
+}
+
 struct ToolCallBuffer {
     call_id: Option<String>,
     name: Option<String>,
@@ -1981,6 +2315,30 @@ enum DeltaResult {
     None,
     Usage(Value),
     RequiresAction,
+}
+
+fn body_token_estimate(body: &Value) -> u64 {
+    let transcript_items = body
+        .get("messages")
+        .or_else(|| body.get("input"))
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let tool_definitions = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    estimate_tokens(
+        serde_json::to_vec(body).map_or(0, |body| body.len()),
+        transcript_items,
+        tool_definitions,
+    )
+}
+
+fn deterministic_summary(messages: &[&piqo_core::MessageProjection]) -> String {
+    format!(
+        "{} earlier messages were compacted deterministically; inspect the durable event log for verbatim history.",
+        messages.len()
+    )
 }
 
 fn build_body(
@@ -2011,10 +2369,14 @@ fn build_body(
         definitions.extend(mcp_tool_definitions(protocol, mcp_tools));
         object.entry("tools").or_insert(Value::Array(definitions));
     }
+    let artifact = projection.context.active_artifact.as_ref();
     let mut transcript = projection
         .messages
         .iter()
         .filter(|message| message.completed || message.interrupted)
+        .filter(|message| {
+            artifact.is_none_or(|artifact| message.last_event_id > artifact.source_end_event_id)
+        })
         .map(|message| {
             let content = if message.blocks.len() == 1 {
                 match &message.blocks[0] {
@@ -2036,6 +2398,12 @@ fn build_body(
             json!({"role": role_name(message.role), "content": content})
         })
         .collect::<Vec<_>>();
+    if let Some(artifact) = artifact {
+        transcript.insert(
+            0,
+            json!({"role": "system", "content": format!("Earlier conversation summary ({}): {}", artifact.artifact_id, artifact.summary)}),
+        );
+    }
     if let Some(instructions) = request
         .agent
         .as_deref()
@@ -2059,6 +2427,10 @@ fn build_body(
                     continue;
                 }
                 let calls = projection.runs.values().flat_map(|run| run.tool_calls.values())
+                    .filter(|call| artifact.is_none_or(|artifact| {
+                        projection.messages.iter().find(|message| message.message_id == call.assistant_message_id)
+                            .is_none_or(|message| message.last_event_id > artifact.source_end_event_id)
+                    }))
                     .filter(|call| call.assistant_message_id == message.message_id)
                     .map(|call| json!({"id": call.call_id, "type": "function", "function": {"name": call.tool_name, "arguments": call.raw_arguments}}))
                     .collect::<Vec<_>>();
@@ -2073,6 +2445,17 @@ fn build_body(
                 .runs
                 .values()
                 .flat_map(|run| run.tool_calls.values())
+                .filter(|call| {
+                    artifact.is_none_or(|artifact| {
+                        projection
+                            .messages
+                            .iter()
+                            .find(|message| message.message_id == call.assistant_message_id)
+                            .is_none_or(|message| {
+                                message.last_event_id > artifact.source_end_event_id
+                            })
+                    })
+                })
             {
                 if let Some(result) = &call.result {
                     transcript.push(json!({"role": "tool", "tool_call_id": call.call_id, "content": result.to_string()}));
@@ -2085,6 +2468,17 @@ fn build_body(
                 .runs
                 .values()
                 .flat_map(|run| run.tool_calls.values())
+                .filter(|call| {
+                    artifact.is_none_or(|artifact| {
+                        projection
+                            .messages
+                            .iter()
+                            .find(|message| message.message_id == call.assistant_message_id)
+                            .is_none_or(|message| {
+                                message.last_event_id > artifact.source_end_event_id
+                            })
+                    })
+                })
             {
                 transcript.push(json!({"type": "function_call", "call_id": call.call_id, "name": call.tool_name, "arguments": call.raw_arguments}));
                 if let Some(result) = &call.result {

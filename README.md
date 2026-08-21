@@ -33,7 +33,6 @@ Designed or partially implemented, but **not wired into the server yet**:
 
 - plugin protocols beyond MCP stdio;
 - orchestrator/subagent execution;
-- context compaction;
 - TLS termination and remote access;
 - a TUI, desktop UI, or other interactive client.
 
@@ -124,6 +123,17 @@ temperature = 0.7
 
 [defaults]
 max_model_turns = 32
+
+[context]
+fallback_context_window_tokens = 131072
+fallback_output_reserve_tokens = 32768
+trigger_ratio = 0.8
+target_ratio = 0.6
+
+[context.compaction]
+strategy = "llm" # or "deterministic"
+summary_max_output_tokens = 2048
+max_retries = 1
 ```
 
 For a provider requiring a bearer token, reference an environment variable
@@ -446,6 +456,20 @@ system-prompt and transcript construction.
 The merge is deliberately **shallow**. If two layers define the same key, the
 entire later value replaces the earlier one. Unknown keys such as `top_k` or
 `chat_template_kwargs` remain untouched.
+
+### Context compaction
+
+Piqo estimates automatic transcripts with the deterministic `utf8_bytes_v1`
+estimator and compacts them before they exceed the configured budget. The
+default fallback assumes a 128k context with 32k reserved for output. A
+caller-owned `body.messages` or `body.input` is never modified; its run records
+`context_compaction_bypassed`. LLM compaction failures fail the run rather than
+silently discarding history.
+
+For providers whose `/v1/models` entries contain capacity fields, configure
+`[providers.<name>.context]` with `context_window_pointer` and
+`output_limit_pointer`; valid provider metadata takes precedence over optional
+per-model limits under `[providers.<name>.context.models.<model>]`.
 
 After merging, piqo fills these fields only when absent:
 

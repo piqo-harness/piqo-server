@@ -592,6 +592,9 @@ tool_execution_started          tool_result
 agent_phase_changed
 permission_requested            permission_resolved
 agent_spawned                   agent_finished
+context_fact_recorded           context_compaction_started
+context_compacted               context_compaction_failed
+context_compaction_bypassed
 ```
 
 This list is additive. A client waiting for one run should correlate events by

@@ -95,7 +95,7 @@ changes state; detailed task tracking belongs in an issue or pull request.
 | M2 | complete | — | 2026-08-21 | Durable permission workflow merged. |
 | M3 | implementing | — | 2026-08-21 | Project-scoped native tools under implementation. |
 | M4 | implementing | — | 2026-08-21 | Core stdio integration merged; fixture, end-to-end, reload, and catalog-generation validation remain. |
-| M5 | not_started | — | — | — |
+| M5 | implementing | — | 2026-08-21 | Durable context budgets and compaction under implementation. |
 | M6 | not_started | — | — | — |
 | M7 | not_started | — | — | — |
 | M8 | not_started | — | — | — |

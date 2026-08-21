@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::PermissionDecision;
+use crate::{ContextProjection, PermissionDecision};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -79,6 +79,10 @@ pub struct MessageProjection {
     pub blocks: Vec<ContentBlock>,
     pub completed: bool,
     pub interrupted: bool,
+    #[serde(default)]
+    pub first_event_id: u64,
+    #[serde(default)]
+    pub last_event_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -131,6 +135,8 @@ pub struct SessionProjection {
     pub pending_permissions: BTreeMap<String, PermissionProjection>,
     pub runs: BTreeMap<String, RunProjection>,
     pub queue_paused: bool,
+    #[serde(default)]
+    pub context: ContextProjection,
 }
 
 impl SessionState {
@@ -235,6 +241,7 @@ impl SessionProjection {
             pending_permissions: BTreeMap::new(),
             runs: BTreeMap::new(),
             queue_paused: false,
+            context: ContextProjection::default(),
         }
     }
 
@@ -276,6 +283,8 @@ impl SessionProjection {
                     blocks: Vec::new(),
                     completed: false,
                     interrupted: false,
+                    first_event_id: event_id,
+                    last_event_id: event_id,
                 });
             }
             crate::SemanticEvent::MessageContentAppended { message_id, block } => {
@@ -288,6 +297,7 @@ impl SessionProjection {
                     return Err(ProjectionError::MessageAlreadyClosed(message_id.clone()));
                 }
                 message.blocks.push(block.clone());
+                message.last_event_id = event_id;
             }
             crate::SemanticEvent::MessageCompleted { message_id } => {
                 let message = self
@@ -299,6 +309,7 @@ impl SessionProjection {
                     return Err(ProjectionError::MessageAlreadyClosed(message_id.clone()));
                 }
                 message.completed = true;
+                message.last_event_id = event_id;
             }
             crate::SemanticEvent::MessageInterrupted { message_id } => {
                 let message = self
@@ -310,6 +321,7 @@ impl SessionProjection {
                     return Err(ProjectionError::MessageAlreadyClosed(message_id.clone()));
                 }
                 message.interrupted = true;
+                message.last_event_id = event_id;
             }
             crate::SemanticEvent::AgentSpawned { agent_id, .. } => {
                 if self
@@ -554,6 +566,27 @@ impl SessionProjection {
             crate::SemanticEvent::QueuePaused => self.queue_paused = true,
             crate::SemanticEvent::QueueResumed => self.queue_paused = false,
             crate::SemanticEvent::SessionForked { .. } => self.queue_paused = true,
+            crate::SemanticEvent::ContextFactRecorded { fact } => {
+                if !self
+                    .context
+                    .durable_facts
+                    .iter()
+                    .any(|existing| existing.fact_id == fact.fact_id)
+                {
+                    self.context.durable_facts.push(fact.clone());
+                }
+            }
+            crate::SemanticEvent::ContextCompacted { artifact, .. } => {
+                self.context.active_artifact = Some(artifact.clone());
+                self.context.last_failure = None;
+                self.context.last_bypass_reason = None;
+            }
+            crate::SemanticEvent::ContextCompactionFailed { code, .. } => {
+                self.context.last_failure = Some(code.clone());
+            }
+            crate::SemanticEvent::ContextCompactionBypassed { reason, .. } => {
+                self.context.last_bypass_reason = Some(reason.clone());
+            }
             _ => {}
         }
         Ok(())

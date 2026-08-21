@@ -10,7 +10,7 @@ use std::{
 };
 
 use chrono::{SecondsFormat, Utc};
-use piqo_provider::{ProviderProtocol, ProviderTransport};
+use piqo_provider::{DiscoveredModel, ProviderProtocol, ProviderTransport};
 use piqo_tools::{McpServerConfig, NativeToolLimits};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -35,8 +35,117 @@ pub struct PiqoConfig {
     pub native_tools: NativeToolsConfig,
     #[serde(default)]
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
+    #[serde(default)]
+    pub context: ContextConfig,
     #[serde(skip)]
     markdown_agents: HashMap<String, AgentDefinition>,
+}
+
+fn default_context_window_tokens() -> u64 {
+    131_072
+}
+fn default_output_reserve_tokens() -> u64 {
+    32_768
+}
+fn default_trigger_ratio() -> f64 {
+    0.8
+}
+fn default_target_ratio() -> f64 {
+    0.6
+}
+fn default_summary_output_tokens() -> u64 {
+    2_048
+}
+fn default_summary_retries() -> u8 {
+    1
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextConfig {
+    #[serde(default = "default_context_window_tokens")]
+    pub fallback_context_window_tokens: u64,
+    #[serde(default = "default_output_reserve_tokens")]
+    pub fallback_output_reserve_tokens: u64,
+    #[serde(default = "default_trigger_ratio")]
+    pub trigger_ratio: f64,
+    #[serde(default = "default_target_ratio")]
+    pub target_ratio: f64,
+    #[serde(default)]
+    pub compaction: CompactionConfig,
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            fallback_context_window_tokens: default_context_window_tokens(),
+            fallback_output_reserve_tokens: default_output_reserve_tokens(),
+            trigger_ratio: default_trigger_ratio(),
+            target_ratio: default_target_ratio(),
+            compaction: CompactionConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionStrategyConfig {
+    Deterministic,
+    Llm,
+}
+
+fn default_compaction_strategy() -> CompactionStrategyConfig {
+    CompactionStrategyConfig::Llm
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactionConfig {
+    #[serde(default = "default_compaction_strategy")]
+    pub strategy: CompactionStrategyConfig,
+    pub summary_provider: Option<String>,
+    pub summary_model: Option<String>,
+    #[serde(default)]
+    pub summary_body: Value,
+    #[serde(default = "default_summary_output_tokens")]
+    pub summary_max_output_tokens: u64,
+    #[serde(default = "default_summary_retries")]
+    pub max_retries: u8,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            strategy: default_compaction_strategy(),
+            summary_provider: None,
+            summary_model: None,
+            summary_body: Value::Null,
+            summary_max_output_tokens: default_summary_output_tokens(),
+            max_retries: default_summary_retries(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderContextConfig {
+    pub context_window_pointer: Option<String>,
+    pub output_limit_pointer: Option<String>,
+    #[serde(default)]
+    pub models: HashMap<String, ModelContextConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelContextConfig {
+    pub context_window_tokens: Option<u64>,
+    pub output_reserve_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedContextBudget {
+    pub context_window_tokens: u64,
+    pub output_reserve_tokens: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -187,6 +296,8 @@ pub struct ProviderConfig {
     pub connect_timeout_seconds: u64,
     #[serde(default)]
     pub models: Option<Vec<String>>,
+    #[serde(default)]
+    pub context: ProviderContextConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -358,6 +469,7 @@ pub enum ConfigError {
 #[derive(Debug, Clone)]
 struct DiscoveryCache {
     models: Vec<String>,
+    metadata: HashMap<String, Value>,
     discovery: ModelDiscovery,
 }
 
@@ -375,6 +487,45 @@ pub struct ConfigManager {
 }
 
 impl PiqoConfig {
+    pub fn context_budget(
+        &self,
+        provider_name: &str,
+        model: &str,
+        metadata: Option<&Value>,
+    ) -> Result<ResolvedContextBudget, ConfigError> {
+        let provider = self
+            .providers
+            .get(provider_name)
+            .ok_or_else(|| ConfigError::ProviderNotFound(provider_name.to_owned()))?;
+        let configured = provider.context.models.get(model);
+        let context_window_tokens = provider
+            .context
+            .context_window_pointer
+            .as_deref()
+            .and_then(|pointer| metadata.and_then(|value| value.pointer(pointer)))
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0)
+            .or_else(|| configured.and_then(|config| config.context_window_tokens))
+            .unwrap_or(self.context.fallback_context_window_tokens);
+        let output_reserve_tokens = provider
+            .context
+            .output_limit_pointer
+            .as_deref()
+            .and_then(|pointer| metadata.and_then(|value| value.pointer(pointer)))
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0)
+            .or_else(|| configured.and_then(|config| config.output_reserve_tokens))
+            .unwrap_or(self.context.fallback_output_reserve_tokens);
+        if output_reserve_tokens >= context_window_tokens {
+            return Err(ConfigError::InvalidProvider(format!(
+                "context output reserve exceeds context window for {provider_name}/{model}"
+            )));
+        }
+        Ok(ResolvedContextBudget {
+            context_window_tokens,
+            output_reserve_tokens,
+        })
+    }
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path_ref = path.as_ref();
         let mut config = if path_ref.exists() {
@@ -397,6 +548,19 @@ impl PiqoConfig {
             provider.validate(name)?;
         }
         self.native_tools.validate()?;
+        if self.context.fallback_context_window_tokens == 0
+            || self.context.fallback_output_reserve_tokens == 0
+            || self.context.fallback_output_reserve_tokens
+                >= self.context.fallback_context_window_tokens
+            || !(0.0 < self.context.target_ratio
+                && self.context.target_ratio < self.context.trigger_ratio
+                && self.context.trigger_ratio < 1.0)
+            || self.context.compaction.summary_max_output_tokens == 0
+        {
+            return Err(ConfigError::InvalidProvider(
+                "invalid context configuration".to_owned(),
+            ));
+        }
         for (id, server) in &self.mcp_servers {
             if !valid_agent_id(id) {
                 return Err(ConfigError::InvalidMcp(format!(
@@ -627,6 +791,7 @@ impl ProviderConfig {
                 .connect_timeout_seconds
                 .unwrap_or_else(default_connect_timeout),
             models: None,
+            context: ProviderContextConfig::default(),
         };
         config.validate(&request.name)?;
         Ok(config)
@@ -667,6 +832,19 @@ impl ProviderConfig {
         }
         if let Some(models) = &self.models {
             normalize_models(models.clone())?;
+        }
+        for pointer in [
+            &self.context.context_window_pointer,
+            &self.context.output_limit_pointer,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !pointer.starts_with('/') {
+                return Err(ConfigError::InvalidProvider(format!(
+                    "context metadata pointer for {name} must start with /"
+                )));
+            }
         }
         Ok(())
     }
@@ -791,6 +969,23 @@ impl ConfigManager {
 
     pub fn resolve_provider(&self, name: &str) -> Result<ResolvedProvider, ConfigError> {
         self.snapshot()?.resolve_provider(name)
+    }
+
+    pub fn context_budget(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Result<ResolvedContextBudget, ConfigError> {
+        let config = self.snapshot()?;
+        let metadata = self
+            .inner
+            .discovery
+            .read()
+            .map_err(|_| ConfigError::LockPoisoned)?
+            .get(provider)
+            .and_then(|cache| cache.metadata.get(model))
+            .cloned();
+        config.context_budget(provider, model, metadata.as_ref())
     }
 
     pub fn body_layers(
@@ -1014,6 +1209,7 @@ impl ConfigManager {
             name,
             DiscoveryCache {
                 models: Vec::new(),
+                metadata: HashMap::new(),
                 discovery: ModelDiscovery {
                     status: DiscoveryStatus::Pending,
                     last_attempt_at: Some(attempted_at.clone()),
@@ -1045,7 +1241,11 @@ impl ConfigManager {
         }
         let cache = match result {
             Ok(models) => DiscoveryCache {
-                models,
+                metadata: models
+                    .iter()
+                    .map(|model: &DiscoveredModel| (model.id.clone(), model.metadata.clone()))
+                    .collect(),
+                models: models.into_iter().map(|model| model.id).collect(),
                 discovery: ModelDiscovery {
                     status: DiscoveryStatus::Succeeded,
                     last_attempt_at: Some(attempted_at),
@@ -1054,6 +1254,7 @@ impl ConfigManager {
             },
             Err(error) => DiscoveryCache {
                 models: Vec::new(),
+                metadata: HashMap::new(),
                 discovery: ModelDiscovery {
                     status: DiscoveryStatus::Failed,
                     last_attempt_at: Some(attempted_at),
@@ -1101,6 +1302,7 @@ impl ConfigManager {
                 .cloned()
                 .unwrap_or_else(|| DiscoveryCache {
                     models: Vec::new(),
+                    metadata: HashMap::new(),
                     discovery: ModelDiscovery {
                         status: DiscoveryStatus::Pending,
                         last_attempt_at: None,

@@ -3,8 +3,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-    AgentPhase, ContentBlock, MessageAuthor, MessageRole, PermissionDecision,
-    PermissionDecisionSource, PermissionScope, SessionPhase,
+    AgentPhase, CompactionStrategy, ContentBlock, ContextArtifact, ContextFact, MessageAuthor,
+    MessageRole, PermissionDecision, PermissionDecisionSource, PermissionScope, SessionPhase,
 };
 
 /// Monotonically increasing identifier assigned to a recorded event.
@@ -149,6 +149,29 @@ pub enum SemanticEvent {
     },
     AgentFinished {
         agent_id: String,
+    },
+    ContextFactRecorded {
+        fact: ContextFact,
+    },
+    ContextCompactionStarted {
+        run_id: String,
+        artifact_id: String,
+        strategy: CompactionStrategy,
+        source_start_event_id: EventId,
+        source_end_event_id: EventId,
+    },
+    ContextCompacted {
+        run_id: String,
+        artifact: ContextArtifact,
+    },
+    ContextCompactionFailed {
+        run_id: String,
+        artifact_id: String,
+        code: String,
+    },
+    ContextCompactionBypassed {
+        run_id: String,
+        reason: String,
     },
 }
 

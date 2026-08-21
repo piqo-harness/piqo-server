@@ -43,6 +43,12 @@ pub enum ProviderDelta {
     RequiresAction,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiscoveredModel {
+    pub id: String,
+    pub metadata: Value,
+}
+
 #[derive(Debug, Error)]
 pub enum ProviderTransportError {
     #[error("provider request failed: {0}")]
@@ -140,7 +146,7 @@ impl ProviderTransport {
         endpoint: &str,
         headers: &HashMap<String, String>,
         connect_timeout: Duration,
-    ) -> Result<Vec<String>, ProviderTransportError> {
+    ) -> Result<Vec<DiscoveredModel>, ProviderTransportError> {
         let client = reqwest::Client::builder()
             .connect_timeout(connect_timeout)
             .timeout(connect_timeout)
@@ -162,7 +168,7 @@ impl ProviderTransport {
     }
 }
 
-fn parse_model_catalog(value: &Value) -> Result<Vec<String>, ProviderTransportError> {
+fn parse_model_catalog(value: &Value) -> Result<Vec<DiscoveredModel>, ProviderTransportError> {
     let data = value
         .get("data")
         .and_then(Value::as_array)
@@ -170,16 +176,20 @@ fn parse_model_catalog(value: &Value) -> Result<Vec<String>, ProviderTransportEr
     let mut models = data
         .iter()
         .map(|model| {
-            model
+            let id = model
                 .get("id")
                 .and_then(Value::as_str)
                 .filter(|id| !id.trim().is_empty())
                 .map(str::to_owned)
-                .ok_or(ProviderTransportError::MalformedModelCatalog)
+                .ok_or(ProviderTransportError::MalformedModelCatalog)?;
+            Ok::<DiscoveredModel, ProviderTransportError>(DiscoveredModel {
+                id,
+                metadata: model.clone(),
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    models.sort();
-    models.dedup();
+    models.sort_by(|left, right| left.id.cmp(&right.id));
+    models.dedup_by(|left, right| left.id == right.id);
     Ok(models)
 }
 
@@ -446,7 +456,13 @@ mod tests {
             "data": [{"id": "zeta"}, {"id": "alpha"}, {"id": "zeta"}]
         }))
         .expect("catalog parses");
-        assert_eq!(models, vec!["alpha", "zeta"]);
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "zeta"]
+        );
     }
 
     #[test]
