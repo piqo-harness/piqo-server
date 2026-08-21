@@ -11,11 +11,38 @@ native tools, and supervise subprocess lifecycle safely.
 Plugin support should reuse MCP/JSON-RPC infrastructure. A separate plugin
 protocol should be introduced only for requirements MCP cannot represent.
 
-## Current gap
+## Implementation status and remaining work
 
-`piqo-tools` depends on the MCP SDK but contains only an `McpServerConfig` value
-and a permission wrapper. There is no transport session, handshake, discovery,
-execution, or subprocess supervision.
+The first implementation slice is merged: configured stdio children are
+started with a minimal environment, initialized through `rmcp`, discovered with
+pagination, and exposed through the MCP permission and M1 continuation path.
+The server also publishes sanitized diagnostics at `GET /api/v1/mcp/servers`.
+
+M4 must remain `implementing` until the following gaps are closed and the
+acceptance criteria below are demonstrated:
+
+- Add a deterministic Rust MCP stdio fixture and `piqo-tools` integration tests
+  covering initialization, paginated `tools/list`, continuous stderr draining,
+  `tools/list_changed` refresh, `tools/call`, bounded shutdown, and absence of
+  orphaned children.
+- Exercise all failure paths against that fixture: invalid JSON Schema and
+  JSON-RPC, incompatible names and collisions, timeout, child crash,
+  oversized result, cancellation, bounded restart, and a side-effect counter
+  proving an uncertain call is never replayed.
+- Add API end-to-end tests in which a provider emits an MCP call and Piqo
+  verifies allow, ask, and deny decisions; the allow path must persist exactly
+  one started event and exactly one result, then resume the same run. Also
+  verify that a client cannot submit a result for a server-managed MCP call.
+- Add configuration-reload coverage for adding, modifying, and removing MCP
+  servers. It must show that newly created turns use the new catalog while a
+  previously emitted turn remains routable against its announced catalog
+  generation.
+- Close and test the catalog-generation boundary used during provider routing:
+  a notification or reload after a turn is announced must not change the set
+  of MCP tools or schemas used to interpret that existing turn.
+- Run and record the locked workspace validation commands after the fixture and
+  API coverage land; only then may the tracker move through `validating` to
+  `complete`.
 
 ## Required design decisions
 
