@@ -1,6 +1,6 @@
 # M5 — Context Management and Compaction
 
-State: `not_started`
+State: `implementing`
 
 ## Outcome
 
@@ -24,6 +24,18 @@ compaction event.
 - What must never be summarized or removed.
 - Whether forks inherit compaction artifacts or recompute them.
 - How caller-supplied raw transcripts interact with harness compaction.
+
+## Recorded decisions
+
+- Resolve limits from configured provider metadata JSON Pointers, then
+  per-model configuration, then a configurable 128k context / 32k output
+  fallback. Use `utf8_bytes_v1`, trigger at 80% of the input budget, and target
+  60% after compaction.
+- Default to a bounded LLM summary; `deterministic` marker compaction is
+  configurable. A summary failure fails the run without replacing the active
+  artifact.
+- Caller-owned `messages` and `input` are never transformed. Forks inherit
+  compaction artifacts already in their copied event prefix.
 
 ## Non-negotiable preservation rules
 
