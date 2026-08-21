@@ -28,7 +28,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Json, Response,
     },
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 #[cfg(test)]
@@ -250,6 +250,28 @@ pub struct CreateSessionRequest {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SubmitToolResultRequest {
     pub result: Value,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ApprovePermissionRequest {
+    pub scope: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PermissionRequestResponse {
+    pub request_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub call_id: Option<String>,
+    pub agent_id: String,
+    pub tool_name: String,
+    pub arguments: Value,
+    pub decision: Option<piqo_core::PermissionDecision>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PermissionRequestsResponse {
+    pub requests: Vec<PermissionRequestResponse>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -805,6 +827,23 @@ pub fn router_with_token(state: AppState, token: Option<String>) -> Router {
         .route(
             "/api/v1/sessions/{session_id}/runs/{run_id}/tool_calls/{call_id}/result",
             post(submit_tool_result),
+        )
+        .route(
+            "/api/v1/sessions/{session_id}/runs/{run_id}/permission_requests",
+            get(list_permission_requests),
+        )
+        .route(
+            "/api/v1/sessions/{session_id}/runs/{run_id}/permission_requests/{request_id}/approve",
+            post(approve_permission),
+        )
+        .route(
+            "/api/v1/sessions/{session_id}/runs/{run_id}/permission_requests/{request_id}/deny",
+            post(deny_permission),
+        )
+        .route("/api/v1/permission-rules", get(list_permission_rules))
+        .route(
+            "/api/v1/permission-rules/{rule_id}",
+            delete(delete_permission_rule),
         )
         .route(
             "/api/v1/sessions/{session_id}/queue/resume",
@@ -1599,6 +1638,86 @@ async fn submit_tool_result(
     Ok(StatusCode::ACCEPTED)
 }
 
+#[utoipa::path(get, path = "/api/v1/sessions/{session_id}/runs/{run_id}/permission_requests", params(("session_id" = String, Path), ("run_id" = String, Path)), responses((status = 200)))]
+async fn list_permission_requests(
+    State(state): State<AppState>,
+    ApiPath((session_id, run_id)): ApiPath<(String, String)>,
+) -> Result<Json<PermissionRequestsResponse>, ApiError> {
+    let projection = state.store().projection(&session_id).await?;
+    if !projection.runs.contains_key(&run_id) {
+        return Err(StoreError::RunNotFound(run_id).into());
+    }
+    let requests = projection
+        .pending_permissions
+        .values()
+        .filter(|request| request.run_id == run_id)
+        .map(|request| PermissionRequestResponse {
+            request_id: request.request_id.clone(),
+            session_id: session_id.clone(),
+            run_id: request.run_id.clone(),
+            call_id: request.call_id.clone(),
+            agent_id: request.agent_id.clone(),
+            tool_name: request.tool_name.clone(),
+            arguments: request.arguments.clone(),
+            decision: request.decision,
+        })
+        .collect();
+    Ok(Json(PermissionRequestsResponse { requests }))
+}
+
+#[utoipa::path(post, path = "/api/v1/sessions/{session_id}/runs/{run_id}/permission_requests/{request_id}/approve", params(("session_id" = String, Path), ("run_id" = String, Path), ("request_id" = String, Path)), request_body = ApprovePermissionRequest, responses((status = 202), (status = 400, body = ErrorResponse), (status = 409, body = ErrorResponse)))]
+async fn approve_permission(
+    State(state): State<AppState>,
+    ApiPath((session_id, run_id, request_id)): ApiPath<(String, String, String)>,
+    ApiJson(request): ApiJson<ApprovePermissionRequest>,
+) -> Result<StatusCode, ApiError> {
+    let scope = match request.scope.as_str() {
+        "once" => piqo_core::PermissionScope::Once,
+        "session" => piqo_core::PermissionScope::Session,
+        "project" => piqo_core::PermissionScope::Project,
+        "configuration" => piqo_core::PermissionScope::Configuration,
+        _ => {
+            return Err(ApiError::BadRequest {
+                code: "invalid_permission_scope",
+                message: "scope must be once, session, project, or configuration".into(),
+            })
+        }
+    };
+    state
+        .supervisor()
+        .approve_permission(&session_id, &run_id, &request_id, scope)
+        .await?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+#[utoipa::path(post, path = "/api/v1/sessions/{session_id}/runs/{run_id}/permission_requests/{request_id}/deny", params(("session_id" = String, Path), ("run_id" = String, Path), ("request_id" = String, Path)), responses((status = 202), (status = 409, body = ErrorResponse)))]
+async fn deny_permission(
+    State(state): State<AppState>,
+    ApiPath((session_id, run_id, request_id)): ApiPath<(String, String, String)>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .supervisor()
+        .deny_permission(&session_id, &run_id, &request_id)
+        .await?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+#[utoipa::path(get, path = "/api/v1/permission-rules", responses((status = 200)))]
+async fn list_permission_rules(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<storage::PermissionRuleRecord>>, ApiError> {
+    Ok(Json(state.store().permission_rules().await?))
+}
+
+#[utoipa::path(delete, path = "/api/v1/permission-rules/{rule_id}", params(("rule_id" = String, Path)), responses((status = 204), (status = 404, body = ErrorResponse)))]
+async fn delete_permission_rule(
+    State(state): State<AppState>,
+    ApiPath(rule_id): ApiPath<String>,
+) -> Result<StatusCode, ApiError> {
+    state.store().delete_permission_rule(&rule_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[utoipa::path(
     post,
     path = "/api/v1/sessions/{session_id}/queue/resume",
@@ -1701,6 +1820,12 @@ fn event_for_sse(event: RecordedEvent) -> Event {
         get_run,
         cancel_run,
         retry_run,
+        submit_tool_result,
+        list_permission_requests,
+        approve_permission,
+        deny_permission,
+        list_permission_rules,
+        delete_permission_rule,
         resume_queue
     ),
     components(schemas(
@@ -1717,6 +1842,7 @@ fn event_for_sse(event: RecordedEvent) -> Event {
         ErrorResponse,
         ErrorBody,
         CreateRunRequest,
+        ApprovePermissionRequest,
         RunAcceptedResponse,
         RunResponse,
         ApiRun,

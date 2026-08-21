@@ -47,6 +47,17 @@ call in the provider turn has a result. Tool execution and permission decisions
 remain client-owned and are not implemented by this endpoint. Runs created with
 caller-owned `body.messages` or `body.input` cannot be continued this way.
 
+Tool calls are permission-gated. `allow` accepts a client-owned result, `ask`
+creates a durable permission request, and `deny` returns a deterministic
+`permission_denied` tool result without executing anything. Clients list and
+resolve requests under the run with `GET .../permission_requests`, then
+`POST .../{request_id}/approve` (body: `{ "scope": "once" | "session" |
+"project" | "configuration" }`) or `POST .../{request_id}/deny`. Reusable
+interactive approvals are listed at `GET /api/v1/permission-rules` and revoked
+with `DELETE /api/v1/permission-rules/{rule_id}`. Explicit `deny` settings in
+agent configuration always win; otherwise approvals apply once, per session,
+per project, or globally in that order.
+
 Both server entry points are loopback-only. The dedicated sidecar additionally
 requires a per-process bearer token; `piqo-cli serve` remains the simple,
 unauthenticated development mode.

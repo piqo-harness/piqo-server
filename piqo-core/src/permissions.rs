@@ -9,6 +9,36 @@ pub enum PermissionDecision {
     Deny,
 }
 
+/// The lifetime of an explicit client approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionScope {
+    Once,
+    Session,
+    Project,
+    Configuration,
+}
+
+/// Where the effective decision originated. This is persisted for auditability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionDecisionSource {
+    Default,
+    Configuration,
+    InteractiveConfiguration,
+    ProjectRule,
+    SessionRule,
+    RequestApproval,
+}
+
+/// An explainable result returned by the pure policy evaluator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionEvaluation {
+    pub decision: PermissionDecision,
+    pub source: PermissionDecisionSource,
+    pub matching_rule: Option<String>,
+}
+
 /// A tool invocation presented to the permission evaluator.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolRequest {
@@ -68,10 +98,29 @@ impl PermissionPolicy {
     }
 
     pub fn evaluate(&self, request: &ToolRequest) -> PermissionDecision {
+        self.evaluate_explained(request).decision
+    }
+
+    pub fn evaluate_explained(&self, request: &ToolRequest) -> PermissionEvaluation {
         self.rules
             .iter()
             .find(|rule| rule.matches(request))
-            .map_or(self.default_decision, |rule| rule.decision)
+            .map_or_else(
+                || PermissionEvaluation {
+                    decision: self.default_decision,
+                    source: PermissionDecisionSource::Default,
+                    matching_rule: None,
+                },
+                |rule| PermissionEvaluation {
+                    decision: rule.decision,
+                    source: PermissionDecisionSource::Configuration,
+                    matching_rule: Some(format!(
+                        "{}:{}",
+                        rule.agent_id.as_deref().unwrap_or("*"),
+                        rule.tool_name
+                    )),
+                },
+            )
     }
 }
 
@@ -117,5 +166,23 @@ mod tests {
             arguments: serde_json::json!({"command": "git status"}),
         };
         assert_eq!(policy.evaluate(&request), PermissionDecision::Ask);
+    }
+
+    #[test]
+    fn explains_the_matching_configuration_rule() {
+        let mut policy = PermissionPolicy::new(PermissionDecision::Deny);
+        policy.add_rule(PermissionRule::new(
+            Some("reviewer"),
+            "read",
+            PermissionDecision::Allow,
+        ));
+        let evaluation = policy.evaluate_explained(&ToolRequest {
+            agent_id: "reviewer".into(),
+            tool_name: "read".into(),
+            arguments: Value::Null,
+        });
+        assert_eq!(evaluation.decision, PermissionDecision::Allow);
+        assert_eq!(evaluation.source, PermissionDecisionSource::Configuration);
+        assert_eq!(evaluation.matching_rule.as_deref(), Some("reviewer:read"));
     }
 }

@@ -2,7 +2,8 @@ use std::{collections::HashMap, path::Path, str::FromStr, sync::Arc, time::Durat
 
 use chrono::{SecondsFormat, Utc};
 use piqo_core::{
-    EventId, ProjectionError, RecordedEvent, SemanticEvent, SessionPhase, SessionProjection,
+    EventId, PermissionScope, ProjectionError, RecordedEvent, SemanticEvent, SessionPhase,
+    SessionProjection,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -43,6 +44,17 @@ pub struct Project {
     pub path: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionRuleRecord {
+    pub id: String,
+    pub scope: PermissionScope,
+    pub session_id: Option<String>,
+    pub project_id: Option<String>,
+    pub agent_id: String,
+    pub tool_name: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Error)]
@@ -102,9 +114,98 @@ pub enum StoreError {
     ShuttingDown,
     #[error("server shutdown timed out while workers were active")]
     ShutdownTimeout,
+    #[error("permission rule {0} was not found")]
+    PermissionRuleNotFound(String),
+    #[error("permission scope is invalid for a durable rule")]
+    InvalidPermissionScope,
 }
 
 impl SqliteStore {
+    pub async fn permission_rules(&self) -> Result<Vec<PermissionRuleRecord>, StoreError> {
+        sqlx::query(
+            "SELECT id, scope, session_id, project_id, agent_id, tool_name, created_at
+             FROM permission_rules ORDER BY created_at DESC, id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(permission_rule_from_row)
+        .collect()
+    }
+
+    pub async fn matching_permission_rule(
+        &self,
+        session_id: &str,
+        project_id: Option<&str>,
+        agent_id: &str,
+        tool_name: &str,
+    ) -> Result<Option<PermissionRuleRecord>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, scope, session_id, project_id, agent_id, tool_name, created_at
+             FROM permission_rules
+             WHERE agent_id = ? AND tool_name = ? AND (
+                (scope = 'session' AND session_id = ?)
+                OR (scope = 'project' AND project_id = ?)
+                OR scope = 'configuration'
+             )
+             ORDER BY CASE scope WHEN 'session' THEN 3 WHEN 'project' THEN 2 ELSE 1 END DESC,
+                      created_at DESC LIMIT 1",
+        )
+        .bind(agent_id)
+        .bind(tool_name)
+        .bind(session_id)
+        .bind(project_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(permission_rule_from_row).transpose()
+    }
+
+    pub async fn create_permission_rule(
+        &self,
+        scope: PermissionScope,
+        session_id: Option<&str>,
+        project_id: Option<&str>,
+        agent_id: &str,
+        tool_name: &str,
+    ) -> Result<PermissionRuleRecord, StoreError> {
+        if matches!(scope, PermissionScope::Once) {
+            return Err(StoreError::InvalidPermissionScope);
+        }
+        let record = PermissionRuleRecord {
+            id: Uuid::now_v7().to_string(),
+            scope,
+            session_id: session_id.map(str::to_owned),
+            project_id: project_id.map(str::to_owned),
+            agent_id: agent_id.to_owned(),
+            tool_name: tool_name.to_owned(),
+            created_at: now(),
+        };
+        sqlx::query(
+            "INSERT INTO permission_rules (id, scope, session_id, project_id, agent_id, tool_name, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&record.id)
+        .bind(permission_scope_name(record.scope))
+        .bind(&record.session_id)
+        .bind(&record.project_id)
+        .bind(&record.agent_id)
+        .bind(&record.tool_name)
+        .bind(&record.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(record)
+    }
+
+    pub async fn delete_permission_rule(&self, id: &str) -> Result<(), StoreError> {
+        let result = sqlx::query("DELETE FROM permission_rules WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::PermissionRuleNotFound(id.to_owned()));
+        }
+        Ok(())
+    }
     pub async fn connect(database_url: &str) -> Result<Self, StoreError> {
         let mut options = SqliteConnectOptions::from_str(database_url)?
             .create_if_missing(true)
@@ -846,6 +947,35 @@ fn project_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Project, StoreError
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
+}
+
+fn permission_rule_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<PermissionRuleRecord, StoreError> {
+    let scope = match row.try_get::<String, _>("scope")?.as_str() {
+        "session" => PermissionScope::Session,
+        "project" => PermissionScope::Project,
+        "configuration" => PermissionScope::Configuration,
+        _ => return Err(StoreError::InvalidPermissionScope),
+    };
+    Ok(PermissionRuleRecord {
+        id: row.try_get("id")?,
+        scope,
+        session_id: row.try_get("session_id")?,
+        project_id: row.try_get("project_id")?,
+        agent_id: row.try_get("agent_id")?,
+        tool_name: row.try_get("tool_name")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+fn permission_scope_name(scope: PermissionScope) -> &'static str {
+    match scope {
+        PermissionScope::Once => "once",
+        PermissionScope::Session => "session",
+        PermissionScope::Project => "project",
+        PermissionScope::Configuration => "configuration",
+    }
 }
 
 async fn ensure_project_in_transaction(

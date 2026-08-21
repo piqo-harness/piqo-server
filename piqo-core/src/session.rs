@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::PermissionDecision;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentPhase {
@@ -109,10 +111,12 @@ pub struct ToolCallProjection {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermissionProjection {
     pub request_id: String,
+    pub run_id: String,
     pub call_id: Option<String>,
     pub agent_id: String,
     pub tool_name: String,
     pub arguments: serde_json::Value,
+    pub decision: Option<PermissionDecision>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -320,24 +324,48 @@ impl SessionProjection {
             }
             crate::SemanticEvent::PermissionRequested {
                 request_id,
+                run_id,
                 call_id,
                 agent_id,
                 tool_name,
                 arguments,
             } => {
+                if self.pending_permissions.contains_key(request_id) {
+                    return Err(ProjectionError::DuplicatePermissionRequest(
+                        request_id.clone(),
+                    ));
+                }
                 self.pending_permissions.insert(
                     request_id.clone(),
                     PermissionProjection {
                         request_id: request_id.clone(),
+                        run_id: run_id.clone(),
                         call_id: call_id.clone(),
                         agent_id: agent_id.clone(),
                         tool_name: tool_name.clone(),
                         arguments: arguments.clone(),
+                        decision: None,
                     },
                 );
             }
-            crate::SemanticEvent::PermissionResolved { request_id, .. } => {
-                self.pending_permissions.remove(request_id);
+            crate::SemanticEvent::PermissionResolved {
+                request_id,
+                decision,
+                ..
+            } => {
+                let pending = self
+                    .pending_permissions
+                    .get_mut(request_id)
+                    .ok_or_else(|| ProjectionError::UnknownPermissionRequest(request_id.clone()))?;
+                match pending.decision {
+                    None => pending.decision = Some(*decision),
+                    Some(existing) if existing == *decision => {}
+                    Some(_) => {
+                        return Err(ProjectionError::ConflictingPermissionResolution(
+                            request_id.clone(),
+                        ))
+                    }
+                }
             }
             crate::SemanticEvent::RunQueued {
                 run_id,
@@ -594,6 +622,12 @@ pub enum ProjectionError {
     DuplicateToolCall(String),
     #[error("tool call {0} is unknown")]
     UnknownToolCall(String),
+    #[error("permission request {0} was emitted more than once")]
+    DuplicatePermissionRequest(String),
+    #[error("permission request {0} is unknown")]
+    UnknownPermissionRequest(String),
+    #[error("permission request {0} already has a different resolution")]
+    ConflictingPermissionResolution(String),
     #[error("tool call {0} already has a different result")]
     ConflictingToolResult(String),
     #[error("message {0} is already closed")]

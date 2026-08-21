@@ -3,7 +3,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-    AgentPhase, ContentBlock, MessageAuthor, MessageRole, PermissionDecision, SessionPhase,
+    AgentPhase, ContentBlock, MessageAuthor, MessageRole, PermissionDecision,
+    PermissionDecisionSource, PermissionScope, SessionPhase,
 };
 
 /// Monotonically increasing identifier assigned to a recorded event.
@@ -116,6 +117,8 @@ pub enum SemanticEvent {
     },
     PermissionRequested {
         request_id: String,
+        #[serde(default)]
+        run_id: String,
         call_id: Option<String>,
         agent_id: String,
         tool_name: String,
@@ -124,6 +127,14 @@ pub enum SemanticEvent {
     PermissionResolved {
         request_id: String,
         decision: PermissionDecision,
+        #[serde(default)]
+        source: Option<PermissionDecisionSource>,
+        #[serde(default)]
+        scope: Option<PermissionScope>,
+        #[serde(default)]
+        rule_id: Option<String>,
+        #[serde(default)]
+        reason: Option<String>,
     },
     AgentSpawned {
         agent_id: String,
