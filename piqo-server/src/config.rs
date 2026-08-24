@@ -39,8 +39,113 @@ pub struct PiqoConfig {
     pub context: ContextConfig,
     #[serde(default)]
     pub orchestration: OrchestrationConfig,
+    #[serde(default)]
+    pub resource_limits: ResourceLimits,
+    #[serde(default)]
+    pub storage: StorageConfig,
     #[serde(skip)]
     markdown_agents: HashMap<String, AgentDefinition>,
+}
+
+const MIB: usize = 1024 * 1024;
+
+/// Process-wide limits for untrusted input and locally managed work.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceLimits {
+    #[serde(default = "default_max_active_runs")]
+    pub max_active_runs: usize,
+    #[serde(default = "default_max_pending_runs")]
+    pub max_pending_runs: usize,
+    #[serde(default = "default_max_pending_runs_per_session")]
+    pub max_pending_runs_per_session: usize,
+    #[serde(default = "default_max_subprocesses")]
+    pub max_subprocesses: usize,
+    #[serde(default = "default_max_http_body_bytes")]
+    pub max_http_body_bytes: usize,
+    #[serde(default = "default_max_provider_request_bytes")]
+    pub max_provider_request_bytes: usize,
+    #[serde(default = "default_max_provider_response_bytes")]
+    pub max_provider_response_bytes: usize,
+    #[serde(default = "default_max_event_payload_bytes")]
+    pub max_event_payload_bytes: usize,
+    #[serde(default = "default_max_sse_connections")]
+    pub max_sse_connections: usize,
+    #[serde(default = "default_max_sse_connections_per_session")]
+    pub max_sse_connections_per_session: usize,
+    #[serde(default = "default_sse_channel_capacity")]
+    pub sse_channel_capacity: usize,
+    #[serde(default = "default_max_dump_bytes")]
+    pub max_dump_bytes: usize,
+    #[serde(default = "default_max_dump_files")]
+    pub max_dump_files: usize,
+}
+
+fn default_max_active_runs() -> usize {
+    8
+}
+fn default_max_pending_runs() -> usize {
+    256
+}
+fn default_max_pending_runs_per_session() -> usize {
+    32
+}
+fn default_max_subprocesses() -> usize {
+    16
+}
+fn default_max_http_body_bytes() -> usize {
+    4 * MIB
+}
+fn default_max_provider_request_bytes() -> usize {
+    4 * MIB
+}
+fn default_max_provider_response_bytes() -> usize {
+    32 * MIB
+}
+fn default_max_event_payload_bytes() -> usize {
+    MIB
+}
+fn default_max_sse_connections() -> usize {
+    256
+}
+fn default_max_sse_connections_per_session() -> usize {
+    16
+}
+fn default_sse_channel_capacity() -> usize {
+    1024
+}
+fn default_max_dump_bytes() -> usize {
+    512 * MIB
+}
+fn default_max_dump_files() -> usize {
+    512
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_active_runs: default_max_active_runs(),
+            max_pending_runs: default_max_pending_runs(),
+            max_pending_runs_per_session: default_max_pending_runs_per_session(),
+            max_subprocesses: default_max_subprocesses(),
+            max_http_body_bytes: default_max_http_body_bytes(),
+            max_provider_request_bytes: default_max_provider_request_bytes(),
+            max_provider_response_bytes: default_max_provider_response_bytes(),
+            max_event_payload_bytes: default_max_event_payload_bytes(),
+            max_sse_connections: default_max_sse_connections(),
+            max_sse_connections_per_session: default_max_sse_connections_per_session(),
+            sse_channel_capacity: default_sse_channel_capacity(),
+            max_dump_bytes: default_max_dump_bytes(),
+            max_dump_files: default_max_dump_files(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageConfig {
+    /// Directory for explicit SQLite backups. Defaults beside the configuration file.
+    pub backup_directory: Option<PathBuf>,
 }
 
 fn default_child_depth() -> u8 {
@@ -531,6 +636,10 @@ pub enum ConfigError {
     InvalidMcp(String),
     #[error("invalid orchestration configuration: {0}")]
     InvalidOrchestration(String),
+    #[error("invalid resource-limit configuration: {0}")]
+    InvalidResourceLimits(String),
+    #[error("invalid storage configuration: {0}")]
+    InvalidStorage(String),
     #[error("configuration is read-only in this server instance")]
     ReadOnly,
     #[error("configuration state lock was poisoned")]
@@ -623,6 +732,49 @@ impl PiqoConfig {
             provider.validate(name)?;
         }
         self.native_tools.validate()?;
+        let limits = &self.resource_limits;
+        if [
+            limits.max_active_runs,
+            limits.max_pending_runs,
+            limits.max_pending_runs_per_session,
+            limits.max_subprocesses,
+            limits.max_http_body_bytes,
+            limits.max_provider_request_bytes,
+            limits.max_provider_response_bytes,
+            limits.max_event_payload_bytes,
+            limits.max_sse_connections,
+            limits.max_sse_connections_per_session,
+            limits.sse_channel_capacity,
+            limits.max_dump_bytes,
+            limits.max_dump_files,
+        ]
+        .into_iter()
+        .any(|value| value == 0)
+        {
+            return Err(ConfigError::InvalidResourceLimits(
+                "all resource limits must be greater than zero".to_owned(),
+            ));
+        }
+        if limits.max_pending_runs_per_session > limits.max_pending_runs {
+            return Err(ConfigError::InvalidResourceLimits(
+                "max_pending_runs_per_session cannot exceed max_pending_runs".to_owned(),
+            ));
+        }
+        if limits.max_sse_connections_per_session > limits.max_sse_connections {
+            return Err(ConfigError::InvalidResourceLimits(
+                "max_sse_connections_per_session cannot exceed max_sse_connections".to_owned(),
+            ));
+        }
+        if self
+            .storage
+            .backup_directory
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err(ConfigError::InvalidStorage(
+                "backup_directory must be an absolute path".to_owned(),
+            ));
+        }
         let orchestration = &self.orchestration;
         if orchestration.max_depth == 0
             || orchestration.max_concurrent_per_tree == 0
@@ -978,6 +1130,10 @@ impl ProviderConfig {
 }
 
 impl ConfigManager {
+    pub fn path(&self) -> Option<&Path> {
+        self.inner.path.as_deref()
+    }
+
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref().to_owned();
         let config = PiqoConfig::load(&path)?;

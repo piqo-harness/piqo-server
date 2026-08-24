@@ -54,6 +54,7 @@ impl ServerError {
         match self {
             Self::InstanceLocked(_) => "instance_already_running",
             Self::Config(_) => "config_invalid",
+            Self::Store(StoreError::CorruptDatabase) => "storage_corrupt",
             Self::Store(_) => "storage_unavailable",
             Self::Bind(_) | Self::BindIo(_) => "bind_failed",
             Self::Io(_) => "storage_unavailable",

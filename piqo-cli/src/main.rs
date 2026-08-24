@@ -67,6 +67,11 @@ enum Command {
         #[command(subcommand)]
         command: ProjectCommand,
     },
+    /// Manage local server storage.
+    Storage {
+        #[command(subcommand)]
+        command: StorageCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -118,6 +123,17 @@ enum ProjectCommand {
         project_id: String,
         #[arg(long)]
         yes: bool,
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        server: String,
+        #[arg(long, env = "PIQO_SERVER_TOKEN")]
+        token: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum StorageCommand {
+    /// Create a consistent SQLite backup through the running server.
+    Backup {
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         server: String,
         #[arg(long, env = "PIQO_SERVER_TOKEN")]
@@ -188,6 +204,19 @@ async fn main() -> Result<()> {
                 token.as_deref(),
             )
             .await?;
+        }
+        Command::Storage {
+            command: StorageCommand::Backup { server, token },
+        } => {
+            let token = token.or_else(|| std::env::var("PIQO_SERVER_TOKEN").ok());
+            let response = authenticated(
+                Client::new().post(format!("{server}/api/v1/storage/backups")),
+                token,
+            )
+            .send()
+            .await?;
+            let response = response.error_for_status()?;
+            println!("{}", response.text().await?);
         }
         Command::Run {
             prompt,

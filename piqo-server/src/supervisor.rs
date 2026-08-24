@@ -19,14 +19,14 @@ use piqo_provider::{
 use piqo_tools::{McpManager, McpToolDefinition, NativeExecutor, NativeTool, ShellProgram};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    config::{ConfigManager, PermissionSetting, PiqoConfig, ResolvedProvider},
+    config::{ConfigManager, PermissionSetting, PiqoConfig, ResolvedProvider, ResourceLimits},
     storage::{AgentLinkRecord, StoreError},
     SqliteStore,
 };
@@ -34,12 +34,19 @@ use crate::{
 #[derive(Clone)]
 pub(crate) struct EventHub {
     channels: Arc<Mutex<HashMap<String, broadcast::Sender<RecordedEvent>>>>,
+    capacity: usize,
 }
 
 impl EventHub {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::with_capacity(256)
+    }
+
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             channels: Arc::new(Mutex::new(HashMap::new())),
+            capacity,
         }
     }
 
@@ -48,7 +55,7 @@ impl EventHub {
         channels.retain(|_, sender| sender.receiver_count() > 0);
         channels
             .entry(session_id.to_owned())
-            .or_insert_with(|| broadcast::channel(256).0)
+            .or_insert_with(|| broadcast::channel(self.capacity).0)
             .subscribe()
     }
 
@@ -82,6 +89,70 @@ impl EventHub {
     }
 }
 
+#[derive(Default)]
+struct AdmissionState {
+    pending: usize,
+    sessions: HashMap<String, usize>,
+    run_sessions: HashMap<String, String>,
+}
+
+#[derive(Clone)]
+struct AdmissionController {
+    state: Arc<Mutex<AdmissionState>>,
+    active: Arc<Semaphore>,
+    limits: ResourceLimits,
+}
+
+impl AdmissionController {
+    fn new(limits: ResourceLimits) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(AdmissionState::default())),
+            active: Arc::new(Semaphore::new(limits.max_active_runs)),
+            limits,
+        }
+    }
+
+    async fn reserve(&self, session_id: &str, run_id: &str) -> Result<(), StoreError> {
+        let mut state = self.state.lock().await;
+        let session_pending = state.sessions.get(session_id).copied().unwrap_or_default();
+        if state.pending >= self.limits.max_pending_runs
+            || session_pending >= self.limits.max_pending_runs_per_session
+        {
+            return Err(StoreError::RunCapacityExceeded);
+        }
+        state.pending += 1;
+        state
+            .sessions
+            .insert(session_id.to_owned(), session_pending + 1);
+        state
+            .run_sessions
+            .insert(run_id.to_owned(), session_id.to_owned());
+        Ok(())
+    }
+
+    async fn release(&self, run_id: &str) {
+        let mut state = self.state.lock().await;
+        let Some(session_id) = state.run_sessions.remove(run_id) else {
+            return;
+        };
+        state.pending = state.pending.saturating_sub(1);
+        if let Some(value) = state.sessions.get_mut(&session_id) {
+            *value = value.saturating_sub(1);
+            if *value == 0 {
+                state.sessions.remove(&session_id);
+            }
+        }
+    }
+
+    async fn acquire_active(&self) -> Result<tokio::sync::OwnedSemaphorePermit, StoreError> {
+        self.active
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| StoreError::ShuttingDown)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRequest {
     pub provider: String,
@@ -106,6 +177,7 @@ pub struct SessionSupervisor {
     dump_dir: Option<PathBuf>,
     shutdown: CancellationToken,
     workers: Arc<StdMutex<JoinSet<()>>>,
+    admission: AdmissionController,
 }
 
 impl SessionSupervisor {
@@ -134,6 +206,11 @@ impl SessionSupervisor {
         dump_dir: Option<PathBuf>,
         shutdown: CancellationToken,
     ) -> Self {
+        let limits = config
+            .snapshot()
+            .expect("configuration snapshot is available")
+            .resource_limits
+            .clone();
         Self {
             store,
             config,
@@ -146,6 +223,7 @@ impl SessionSupervisor {
             dump_dir,
             shutdown,
             workers: Arc::new(StdMutex::new(JoinSet::new())),
+            admission: AdmissionController::new(limits),
         }
     }
 
@@ -276,18 +354,24 @@ impl SessionSupervisor {
                 other => StoreError::ProviderUnavailable(other.to_string()),
             })?;
         let run_id = Uuid::now_v7().to_string();
+        self.admission.reserve(session_id, &run_id).await?;
         let payload = serde_json::to_value(&request).map_err(StoreError::Json)?;
-        self.append(
-            session_id,
-            SemanticEvent::RunQueued {
-                run_id: run_id.clone(),
-                retry_of: None,
-                provider: request.provider,
-                model: request.model,
-                request: payload,
-            },
-        )
-        .await?;
+        let appended = self
+            .append(
+                session_id,
+                SemanticEvent::RunQueued {
+                    run_id: run_id.clone(),
+                    retry_of: None,
+                    provider: request.provider,
+                    model: request.model,
+                    request: payload,
+                },
+            )
+            .await;
+        if let Err(error) = appended {
+            self.admission.release(&run_id).await;
+            return Err(error);
+        }
         self.spawn_worker(session_id.to_owned());
         Ok(run_id)
     }
@@ -621,6 +705,7 @@ impl SessionSupervisor {
         let request: RunRequest =
             serde_json::from_value(run.request.clone()).map_err(StoreError::Json)?;
         let new_id = Uuid::now_v7().to_string();
+        self.admission.reserve(session_id, &new_id).await?;
         let request_value = serde_json::to_value(&request).map_err(StoreError::Json)?;
         let mut events = vec![SemanticEvent::RunQueued {
             run_id: new_id.clone(),
@@ -632,7 +717,10 @@ impl SessionSupervisor {
         if self.store.projection(session_id).await?.queue_paused {
             events.push(SemanticEvent::QueueResumed);
         }
-        self.append_many(session_id, events).await?;
+        if let Err(error) = self.append_many(session_id, events).await {
+            self.admission.release(&new_id).await;
+            return Err(error);
+        }
         self.spawn_worker(session_id.to_owned());
         Ok(new_id)
     }
@@ -782,6 +870,7 @@ impl SessionSupervisor {
                         .lock()
                         .await
                         .insert(run.run_id.clone(), token.clone());
+                    let _active_permit = self.admission.acquire_active().await?;
                     let result = self
                         .execute_run_with_child_timeout(session_id, &run, token, None, None, 0)
                         .await;
@@ -839,6 +928,7 @@ impl SessionSupervisor {
                 }
                 run.attempt_id = Some(attempt_id);
                 run.attempts += 1;
+                let _active_permit = self.admission.acquire_active().await?;
                 let result = self
                     .execute_run_with_child_timeout(session_id, &run, token, None, None, 0)
                     .await;
@@ -1065,6 +1155,16 @@ impl SessionSupervisor {
         };
         let provider = &execution.provider;
         let body = &execution.body;
+        let max_provider_request_bytes = match self.config.snapshot() {
+            Ok(config) => config.resource_limits.max_provider_request_bytes,
+            Err(error) => return ExecutionResult::Failed(error.to_string(), false),
+        };
+        if serde_json::to_vec(body)
+            .map(|bytes| bytes.len() > max_provider_request_bytes)
+            .unwrap_or(true)
+        {
+            return ExecutionResult::Failed("provider_request_too_large".to_owned(), false);
+        }
         let is_existing_assistant = existing_assistant_message.is_some();
         let assistant_message_id =
             existing_assistant_message.unwrap_or_else(|| Uuid::now_v7().to_string());
@@ -2714,6 +2814,7 @@ impl SessionSupervisor {
     ) -> Result<RecordedEvent, StoreError> {
         let recorded = self.store.append_event(session_id, event).await?;
         self.hub.publish(recorded.clone()).await;
+        self.release_terminal_admission(&recorded.event).await;
         Ok(recorded)
     }
 
@@ -2725,8 +2826,22 @@ impl SessionSupervisor {
         let recorded = self.store.append_events(session_id, events).await?;
         for event in &recorded {
             self.hub.publish(event.clone()).await;
+            self.release_terminal_admission(&event.event).await;
         }
         Ok(recorded)
+    }
+
+    async fn release_terminal_admission(&self, event: &SemanticEvent) {
+        let run_id = match event {
+            SemanticEvent::RunCompleted { run_id, .. }
+            | SemanticEvent::RunFailed { run_id, .. }
+            | SemanticEvent::RunCancelled { run_id, .. }
+            | SemanticEvent::RunInterrupted { run_id, .. } => Some(run_id),
+            _ => None,
+        };
+        if let Some(run_id) = run_id {
+            self.admission.release(run_id).await;
+        }
     }
 }
 

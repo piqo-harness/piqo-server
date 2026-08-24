@@ -13,14 +13,50 @@ use sqlx::{
 };
 use thiserror::Error;
 use tokio::sync::Mutex;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 pub const EVENT_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryRetention {
+    #[default]
+    Forever,
+    OneYear,
+    SixMonths,
+    ThreeMonths,
+    OneMonth,
+}
+
+impl HistoryRetention {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Forever => "forever",
+            Self::OneYear => "one_year",
+            Self::SixMonths => "six_months",
+            Self::ThreeMonths => "three_months",
+            Self::OneMonth => "one_month",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "forever" => Ok(Self::Forever),
+            "one_year" => Ok(Self::OneYear),
+            "six_months" => Ok(Self::SixMonths),
+            "three_months" => Ok(Self::ThreeMonths),
+            "one_month" => Ok(Self::OneMonth),
+            _ => Err(StoreError::InvalidRetention),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
     pool: SqlitePool,
     projection_cache: Arc<Mutex<HashMap<String, SessionProjection>>>,
+    database_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +71,7 @@ pub struct SessionSummary {
     pub phase: SessionPhase,
     pub revision: u64,
     pub last_event_id: EventId,
+    pub history_retention: HistoryRetention,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +111,8 @@ pub struct AgentLinkRecord {
 
 #[derive(Debug, Error)]
 pub enum StoreError {
+    #[error("storage I/O error: {0}")]
+    Io(#[from] std::io::Error),
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("database migration error: {0}")]
@@ -133,6 +172,16 @@ pub enum StoreError {
     ShuttingDown,
     #[error("server shutdown timed out while workers were active")]
     ShutdownTimeout,
+    #[error("run capacity has been reached")]
+    RunCapacityExceeded,
+    #[error("SSE connection capacity has been reached")]
+    SseCapacityExceeded,
+    #[error("session retention value is invalid")]
+    InvalidRetention,
+    #[error("SQLite integrity check failed")]
+    CorruptDatabase,
+    #[error("SQLite backups are unavailable for this database")]
+    BackupUnavailable,
     #[error("permission rule {0} was not found")]
     PermissionRuleNotFound(String),
     #[error("permission scope is invalid for a durable rule")]
@@ -289,10 +338,23 @@ impl SqliteStore {
             .max_connections(max_connections)
             .connect_with(options)
             .await?;
+        let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(&pool)
+            .await?;
+        if integrity != "ok" {
+            return Err(StoreError::CorruptDatabase);
+        }
+        let foreign_keys = sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await?;
+        if !foreign_keys.is_empty() {
+            return Err(StoreError::CorruptDatabase);
+        }
         sqlx::migrate!("./migrations").run(&pool).await?;
         let store = Self {
             pool,
             projection_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_url: database_url.to_owned(),
         };
         store.validate_all().await?;
         Ok(store)
@@ -301,6 +363,18 @@ impl SqliteStore {
     pub async fn connect_file(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref().to_string_lossy();
         Self::connect(&format!("sqlite://{path}")).await
+    }
+
+    pub async fn backup_to(&self, destination: &Path) -> Result<u64, StoreError> {
+        if self.database_url.contains(":memory:") || destination.exists() {
+            return Err(StoreError::BackupUnavailable);
+        }
+        let destination = destination.to_str().ok_or(StoreError::BackupUnavailable)?;
+        sqlx::query("VACUUM INTO ?")
+            .bind(destination)
+            .execute(&self.pool)
+            .await?;
+        Ok(std::fs::metadata(destination)?.len())
     }
 
     pub async fn recover_running_sessions(&self) -> Result<Vec<RecordedEvent>, StoreError> {
@@ -338,6 +412,16 @@ impl SqliteStore {
         title: Option<String>,
         project_id: Option<String>,
     ) -> Result<SessionSummary, StoreError> {
+        self.create_session_with_retention(title, project_id, HistoryRetention::Forever)
+            .await
+    }
+
+    pub async fn create_session_with_retention(
+        &self,
+        title: Option<String>,
+        project_id: Option<String>,
+        history_retention: HistoryRetention,
+    ) -> Result<SessionSummary, StoreError> {
         let id = Uuid::now_v7().to_string();
         let now = now();
         let mut tx = self.pool.begin().await?;
@@ -345,14 +429,15 @@ impl SqliteStore {
             ensure_project_in_transaction(&mut tx, project_id).await?;
         }
         sqlx::query(
-            "INSERT INTO sessions (id, title, project_id, created_at, updated_at, phase, revision, last_event_id)
-             VALUES (?, ?, ?, ?, ?, 'created', 0, 1)",
+            "INSERT INTO sessions (id, title, project_id, created_at, updated_at, phase, revision, last_event_id, history_retention)
+             VALUES (?, ?, ?, ?, ?, 'created', 0, 1, ?)",
         )
         .bind(&id)
         .bind(&title)
         .bind(&project_id)
         .bind(&now)
         .bind(&now)
+        .bind(history_retention.as_str())
         .execute(&mut *tx)
         .await?;
         self.insert_event_row(
@@ -370,7 +455,7 @@ impl SqliteStore {
     pub async fn get_session(&self, session_id: &str) -> Result<SessionSummary, StoreError> {
         let row = sqlx::query(
             "SELECT id, title, project_id, parent_session_id, forked_at_event_id, created_at, updated_at,
-                    phase, revision, last_event_id
+                    phase, revision, last_event_id, history_retention
              FROM sessions WHERE id = ?",
         )
         .bind(session_id)
@@ -378,6 +463,22 @@ impl SqliteStore {
         .await?
         .ok_or_else(|| StoreError::SessionNotFound(session_id.to_owned()))?;
         summary_from_row(&row)
+    }
+
+    pub async fn update_session_retention(
+        &self,
+        session_id: &str,
+        history_retention: HistoryRetention,
+    ) -> Result<SessionSummary, StoreError> {
+        let result = sqlx::query("UPDATE sessions SET history_retention = ? WHERE id = ?")
+            .bind(history_retention.as_str())
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::SessionNotFound(session_id.to_owned()));
+        }
+        self.get_session(session_id).await
     }
 
     pub async fn projection(&self, session_id: &str) -> Result<SessionProjection, StoreError> {
@@ -403,7 +504,7 @@ impl SqliteStore {
             let (created_at, id) = decode_cursor(cursor)?;
             sqlx::query(
                 "SELECT id, title, project_id, parent_session_id, forked_at_event_id, created_at, updated_at,
-                        phase, revision, last_event_id
+                        phase, revision, last_event_id, history_retention
                  FROM sessions
                  WHERE (created_at, id) < (?, ?)
                  ORDER BY created_at DESC, id DESC LIMIT ?",
@@ -416,7 +517,7 @@ impl SqliteStore {
         } else {
             sqlx::query(
                 "SELECT id, title, project_id, parent_session_id, forked_at_event_id, created_at, updated_at,
-                        phase, revision, last_event_id
+                        phase, revision, last_event_id, history_retention
                  FROM sessions ORDER BY created_at DESC, id DESC LIMIT ?",
             )
             .bind(i64::from(limit) + 1)
@@ -468,13 +569,13 @@ impl SqliteStore {
         let limit = limit.clamp(1, 200);
         let query = if cursor.is_some() {
             format!(
-                "SELECT id, title, project_id, parent_session_id, forked_at_event_id, created_at, updated_at, phase, revision, last_event_id
+                "SELECT id, title, project_id, parent_session_id, forked_at_event_id, created_at, updated_at, phase, revision, last_event_id, history_retention
                  FROM sessions WHERE {clause} AND (created_at, id) < (?, ?)
                  ORDER BY created_at DESC, id DESC LIMIT ?"
             )
         } else {
             format!(
-                "SELECT id, title, project_id, parent_session_id, forked_at_event_id, created_at, updated_at, phase, revision, last_event_id
+                "SELECT id, title, project_id, parent_session_id, forked_at_event_id, created_at, updated_at, phase, revision, last_event_id, history_retention
                  FROM sessions WHERE {clause} ORDER BY created_at DESC, id DESC LIMIT ?"
             )
         };
@@ -1004,6 +1105,9 @@ fn summary_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SessionSummary, Sto
             .map_err(|_| sqlx::Error::Protocol("negative revision".into()))?,
         last_event_id: u64::try_from(row.try_get::<i64, _>("last_event_id")?)
             .map_err(|_| sqlx::Error::Protocol("negative event id".into()))?,
+        history_retention: HistoryRetention::parse(
+            &row.try_get::<String, _>("history_retention")?,
+        )?,
     })
 }
 

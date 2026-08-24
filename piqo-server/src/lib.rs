@@ -10,7 +10,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::Duration,
@@ -19,8 +19,8 @@ use std::{
 use async_stream::stream;
 use axum::{
     extract::{
-        FromRequest, FromRequestParts, Json as AxumJson, Path as AxumPath, Query as AxumQuery,
-        Request, State,
+        DefaultBodyLimit, FromRequest, FromRequestParts, Json as AxumJson, Path as AxumPath,
+        Query as AxumQuery, Request, State,
     },
     http::{HeaderMap, StatusCode},
     middleware,
@@ -39,7 +39,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
@@ -50,13 +50,14 @@ pub use config::{
     ConfigSnapshot, CreateProviderRequest, DiscoveryStatus, ModelDiscovery, ModelSource,
     OrchestrationConfig, PermissionSetting, PiqoConfig, ProviderCatalogEntry, ProviderConfig,
     ProviderCredentialInput, ProviderCredentialSummary, ProviderModelsResponse,
-    ReplaceProviderModelsRequest, UpdateProviderRequest,
+    ReplaceProviderModelsRequest, ResourceLimits, StorageConfig, UpdateProviderRequest,
 };
 pub use runtime::{
     ensure_private_directory, prepare_server, PreparedServer, ServerError, ServerOptions,
 };
 pub use storage::{
-    AgentLinkRecord, Project, SessionSummary, SqliteStore, StoreError, EVENT_SCHEMA_VERSION,
+    AgentLinkRecord, HistoryRetention, Project, SessionSummary, SqliteStore, StoreError,
+    EVENT_SCHEMA_VERSION,
 };
 use supervisor::EventHub;
 pub use supervisor::{RunRequest, SessionSupervisor};
@@ -86,6 +87,34 @@ pub struct AppState {
     lifecycle: Arc<LifecycleState>,
     shutdown: CancellationToken,
     fatal_reload_error: Arc<Mutex<Option<String>>>,
+    metrics: Arc<Metrics>,
+    sse_connections: Arc<Semaphore>,
+    sse_connections_by_session: Arc<Mutex<std::collections::HashMap<String, Arc<Semaphore>>>>,
+    max_sse_connections_per_session: usize,
+}
+
+#[derive(Default)]
+struct Metrics {
+    requests_total: AtomicU64,
+    run_capacity_rejections: AtomicU64,
+    sse_capacity_rejections: AtomicU64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MetricsResponse {
+    pub requests_total: u64,
+    pub run_capacity_rejections: u64,
+    pub sse_capacity_rejections: u64,
+}
+
+impl Metrics {
+    fn snapshot(&self) -> MetricsResponse {
+        MetricsResponse {
+            requests_total: self.requests_total.load(Ordering::Relaxed),
+            run_capacity_rejections: self.run_capacity_rejections.load(Ordering::Relaxed),
+            sse_capacity_rejections: self.sse_capacity_rejections.load(Ordering::Relaxed),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -168,7 +197,12 @@ impl AppState {
         dump_dir: Option<std::path::PathBuf>,
         shutdown: CancellationToken,
     ) -> Self {
-        let hub = EventHub::new();
+        let resource_limits = config
+            .snapshot()
+            .expect("configuration snapshot is available")
+            .resource_limits
+            .clone();
+        let hub = EventHub::with_capacity(resource_limits.sse_channel_capacity);
         let mcp = McpManager::new(
             config
                 .snapshot()
@@ -194,6 +228,10 @@ impl AppState {
             lifecycle: Arc::new(LifecycleState::default()),
             shutdown,
             fatal_reload_error: Arc::new(Mutex::new(None)),
+            metrics: Arc::new(Metrics::default()),
+            sse_connections: Arc::new(Semaphore::new(resource_limits.max_sse_connections)),
+            sse_connections_by_session: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            max_sse_connections_per_session: resource_limits.max_sse_connections_per_session,
         }
     }
 
@@ -259,8 +297,34 @@ impl AppState {
         self.hub.subscribe(session_id).await
     }
 
+    async fn acquire_sse_connection(
+        &self,
+        session_id: &str,
+    ) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), StoreError> {
+        let global = self
+            .sse_connections
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| StoreError::SseCapacityExceeded)?;
+        let session = {
+            let mut connections = self.sse_connections_by_session.lock().await;
+            connections
+                .entry(session_id.to_owned())
+                .or_insert_with(|| Arc::new(Semaphore::new(self.max_sse_connections_per_session)))
+                .clone()
+        };
+        let per_session = session
+            .try_acquire_owned()
+            .map_err(|_| StoreError::SseCapacityExceeded)?;
+        Ok((global, per_session))
+    }
+
     pub(crate) fn lifecycle(&self) -> Arc<LifecycleState> {
         self.lifecycle.clone()
+    }
+
+    fn metrics(&self) -> Arc<Metrics> {
+        self.metrics.clone()
     }
 }
 
@@ -268,6 +332,12 @@ impl AppState {
 pub struct CreateSessionRequest {
     pub title: Option<String>,
     pub project_id: Option<String>,
+    pub history_retention: Option<HistoryRetention>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateSessionRetentionRequest {
+    pub history_retention: HistoryRetention,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -354,6 +424,7 @@ pub struct ApiSessionSummary {
     pub phase: String,
     pub revision: u64,
     pub last_event_id: EventId,
+    pub history_retention: HistoryRetention,
     pub projection: Value,
 }
 
@@ -370,6 +441,7 @@ impl From<SessionSummary> for ApiSessionSummary {
             phase: session_phase_name(summary.phase).to_owned(),
             revision: summary.revision,
             last_event_id: summary.last_event_id,
+            history_retention: summary.history_retention,
             projection: Value::Null,
         }
     }
@@ -469,6 +541,12 @@ pub struct ConfigReloadResponse {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+pub struct BackupResponse {
+    pub file_name: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ApiEvent {
     pub id: EventId,
     pub session_id: String,
@@ -542,6 +620,7 @@ pub enum ApiError {
     Config(ConfigError),
     BadRequest { code: &'static str, message: String },
     InvalidConfig(String),
+    PayloadTooLarge,
 }
 
 struct ApiJson<T>(T);
@@ -560,9 +639,15 @@ where
         AxumJson::<T>::from_request(req, state)
             .await
             .map(|AxumJson(value)| Self(value))
-            .map_err(|error| ApiError::BadRequest {
-                code: "invalid_request",
-                message: error.to_string(),
+            .map_err(|error| {
+                if error.to_string().contains("length limit") {
+                    ApiError::PayloadTooLarge
+                } else {
+                    ApiError::BadRequest {
+                        code: "invalid_request",
+                        message: error.to_string(),
+                    }
+                }
             })
     }
 }
@@ -623,7 +708,48 @@ impl From<ConfigError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
+        if matches!(self, Self::PayloadTooLarge) {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(ErrorResponse {
+                    error: ErrorBody {
+                        code: "payload_too_large".to_owned(),
+                        message: "request body exceeds the configured limit".to_owned(),
+                    },
+                }),
+            )
+                .into_response();
+        }
+        if matches!(self, Self::Store(StoreError::RunCapacityExceeded)) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(axum::http::header::RETRY_AFTER, "1")],
+                Json(ErrorResponse {
+                    error: ErrorBody {
+                        code: "run_capacity_exceeded".to_owned(),
+                        message: "run capacity has been reached".to_owned(),
+                    },
+                }),
+            )
+                .into_response();
+        }
+        if matches!(self, Self::Store(StoreError::SseCapacityExceeded)) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(axum::http::header::RETRY_AFTER, "1")],
+                Json(ErrorResponse {
+                    error: ErrorBody {
+                        code: "sse_capacity_exceeded".to_owned(),
+                        message: "SSE connection capacity has been reached".to_owned(),
+                    },
+                }),
+            )
+                .into_response();
+        }
         let (status, code, message) = match self {
+            Self::PayloadTooLarge
+            | Self::Store(StoreError::RunCapacityExceeded)
+            | Self::Store(StoreError::SseCapacityExceeded) => unreachable!(),
             Self::BadRequest { code, message } => (StatusCode::BAD_REQUEST, code, message),
             Self::InvalidConfig(message) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "config_invalid", message)
@@ -725,6 +851,11 @@ impl IntoResponse for ApiError {
                 "conflict",
                 "session queue is not paused".to_owned(),
             ),
+            Self::Store(StoreError::BackupUnavailable) => (
+                StatusCode::CONFLICT,
+                "backup_unavailable",
+                "a backup cannot be created for this database".to_owned(),
+            ),
             Self::Store(StoreError::ShuttingDown) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "server_shutting_down",
@@ -809,8 +940,16 @@ pub fn router(state: AppState) -> Router {
 
 pub fn router_with_token(state: AppState, token: Option<String>) -> Router {
     let lifecycle = state.lifecycle();
+    let metrics_state = state.metrics();
+    let max_http_body_bytes = state
+        .config()
+        .snapshot()
+        .expect("configuration snapshot is available")
+        .resource_limits
+        .max_http_body_bytes;
     let mut router = Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/metrics", get(metrics))
         .route("/api/v1/openapi.json", get(openapi))
         .route("/api/v1/projects", post(create_project).get(list_projects))
         .route(
@@ -824,6 +963,10 @@ pub fn router_with_token(state: AppState, token: Option<String>) -> Router {
             get(list_project_sessions),
         )
         .route("/api/v1/sessions", post(create_session).get(list_sessions))
+        .route(
+            "/api/v1/sessions/{session_id}/retention",
+            axum::routing::patch(update_session_retention),
+        )
         .route("/api/v1/sessions/{session_id}", get(get_session))
         .route("/api/v1/sessions/{session_id}/events", get(get_events))
         .route(
@@ -857,6 +1000,7 @@ pub fn router_with_token(state: AppState, token: Option<String>) -> Router {
             post(refresh_provider_models),
         )
         .route("/api/v1/config/reload", post(reload_config))
+        .route("/api/v1/storage/backups", post(create_backup))
         .route("/api/v1/mcp/servers", get(list_mcp_servers))
         .route("/api/v1/sessions/{session_id}/runs", post(create_run))
         .route("/api/v1/sessions/{session_id}/runs/{run_id}", get(get_run))
@@ -893,6 +1037,7 @@ pub fn router_with_token(state: AppState, token: Option<String>) -> Router {
             "/api/v1/sessions/{session_id}/queue/resume",
             post(resume_queue),
         )
+        .layer(DefaultBodyLimit::max(max_http_body_bytes))
         .layer(TraceLayer::new_for_http())
         .method_not_allowed_fallback(api_method_not_allowed)
         .fallback(api_not_found)
@@ -908,6 +1053,20 @@ pub fn router_with_token(state: AppState, token: Option<String>) -> Router {
                 }
             },
         ));
+    router = router.layer(middleware::from_fn(
+        move |request: Request, next: middleware::Next| {
+            let metrics = metrics_state.clone();
+            async move {
+                metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+                let request_id = uuid::Uuid::now_v7().to_string();
+                let mut response = next.run(request).await;
+                if let Ok(value) = axum::http::HeaderValue::from_str(&request_id) {
+                    response.headers_mut().insert("x-request-id", value);
+                }
+                response
+            }
+        },
+    ));
     if let Some(token) = token {
         let expected = Arc::<str>::from(token);
         router = router.layer(middleware::from_fn(
@@ -1042,6 +1201,11 @@ async fn health() -> Json<HealthResponse> {
         server_version: SERVER_VERSION,
         api_version: API_VERSION,
     })
+}
+
+#[utoipa::path(get, path = "/api/v1/metrics", responses((status = 200, body = MetricsResponse)))]
+async fn metrics(State(state): State<AppState>) -> Json<MetricsResponse> {
+    Json(state.metrics().snapshot())
 }
 
 #[utoipa::path(
@@ -1184,10 +1348,34 @@ async fn create_session(
         Json(ApiSessionSummary::from(
             state
                 .store
-                .create_session(request.title, request.project_id)
+                .create_session_with_retention(
+                    request.title,
+                    request.project_id,
+                    request.history_retention.unwrap_or_default(),
+                )
                 .await?,
         )),
     ))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/sessions/{session_id}/retention",
+    params(("session_id" = String, Path)),
+    request_body = UpdateSessionRetentionRequest,
+    responses((status = 200, body = ApiSessionSummary), (status = 404, body = ErrorResponse))
+)]
+async fn update_session_retention(
+    State(state): State<AppState>,
+    ApiPath(session_id): ApiPath<String>,
+    ApiJson(request): ApiJson<UpdateSessionRetentionRequest>,
+) -> Result<Json<ApiSessionSummary>, ApiError> {
+    Ok(Json(ApiSessionSummary::from(
+        state
+            .store()
+            .update_session_retention(&session_id, request.history_retention)
+            .await?,
+    )))
 }
 
 #[utoipa::path(
@@ -1278,9 +1466,12 @@ async fn stream_events(
 ) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     state.store.get_session(&session_id).await?;
     let after = parse_last_event_id(&headers)?;
+    let (global_sse_permit, session_sse_permit) = state.acquire_sse_connection(&session_id).await?;
     let mut receiver = state.subscribe(&session_id).await;
     let replay = state.store.events(&session_id, after, u32::MAX).await?;
     let stream = stream! {
+        let _global_sse_permit = global_sse_permit;
+        let _session_sse_permit = session_sse_permit;
         let mut last_id = after;
         for recorded in replay {
             if recorded.id > last_id {
@@ -1421,6 +1612,39 @@ async fn reload_config(
             Err(ApiError::InvalidConfig(message))
         }
     }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/storage/backups",
+    responses((status = 201, body = BackupResponse), (status = 409, body = ErrorResponse))
+)]
+async fn create_backup(
+    State(state): State<AppState>,
+) -> Result<(StatusCode, Json<BackupResponse>), ApiError> {
+    let config = state.config().snapshot()?;
+    let directory = config
+        .storage
+        .backup_directory
+        .clone()
+        .or_else(|| {
+            state
+                .config()
+                .path()
+                .and_then(|path| path.parent())
+                .map(|parent| parent.join("backups"))
+        })
+        .ok_or_else(|| ApiError::BadRequest {
+            code: "backup_unavailable",
+            message: "a configuration-backed database is required for backups".to_owned(),
+        })?;
+    runtime::ensure_private_directory(&directory).map_err(StoreError::Io)?;
+    let file_name = format!("piqo-{}.sqlite", uuid::Uuid::now_v7());
+    let bytes = state.store().backup_to(&directory.join(&file_name)).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(BackupResponse { file_name, bytes }),
+    ))
 }
 
 #[utoipa::path(
@@ -1872,6 +2096,7 @@ fn event_for_sse(event: RecordedEvent) -> Event {
     paths(
         openapi,
         health,
+        metrics,
         create_project,
         list_projects,
         get_project,
@@ -1879,6 +2104,7 @@ fn event_for_sse(event: RecordedEvent) -> Event {
         delete_project,
         list_project_sessions,
         create_session,
+        update_session_retention,
         list_sessions,
         get_session,
         get_events,
@@ -1896,6 +2122,7 @@ fn event_for_sse(event: RecordedEvent) -> Event {
         clear_provider_models,
         refresh_provider_models,
         reload_config,
+        create_backup,
         list_mcp_servers,
         create_run,
         get_run,
@@ -1911,12 +2138,15 @@ fn event_for_sse(event: RecordedEvent) -> Event {
     ),
     components(schemas(
         HealthResponse,
+        MetricsResponse,
         CreateProjectRequest,
         UpdateProjectRequest,
         ApiProject,
         ProjectListResponse,
         CreateSessionRequest,
+        UpdateSessionRetentionRequest,
         ApiSessionSummary,
+        HistoryRetention,
         SessionListResponse,
         ForkSessionRequest,
         ApiEvent,
@@ -1934,6 +2164,7 @@ fn event_for_sse(event: RecordedEvent) -> Event {
         AgentPermissions,
         PermissionSetting,
         ConfigReloadResponse,
+        BackupResponse,
         ProviderCatalogEntry,
         CreateProviderRequest,
         UpdateProviderRequest,
