@@ -97,7 +97,7 @@ changes state; detailed task tracking belongs in an issue or pull request.
 | M4 | implementing | — | 2026-08-21 | Core stdio integration merged; fixture, end-to-end, reload, and catalog-generation validation remain. |
 | M5 | implementing | — | 2026-08-21 | Durable context budgets and compaction under implementation. |
 | M6 | designing | — | 2026-08-23 | Linked-session delegation, durable agent links, and tree inspection are being designed; implementation remains gated on M3 and M5 contracts. |
-| M7 | not_started | — | — | — |
+| M7 | implementing | — | 2026-08-24 | Resource, storage, and observability hardening implementation started; completion remains gated on M3–M6 acceptance. |
 | M8 | not_started | — | — | — |
 
 ## Definition of ready

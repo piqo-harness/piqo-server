@@ -111,6 +111,7 @@ Stable protocol version 1 codes are:
 | `instance_already_running` | Another process owns `piqo.lock`. |
 | `config_invalid` | `piqo.toml` cannot be loaded or parsed. |
 | `storage_unavailable` | The profile, token source, or SQLite storage is unavailable. |
+| `storage_corrupt` | SQLite integrity or foreign-key validation failed; recover the database before reuse. |
 | `bind_failed` | The loopback listener could not bind. |
 
 The client MUST branch on `code`, not `message`. The message is diagnostic and
@@ -172,6 +173,8 @@ All JSON API failures use this envelope:
 
 Clients MUST use the HTTP status and `error.code` for control flow, never the
 message. A client SHOULD preserve unknown error codes as structured failures.
+Every response includes a server-generated `x-request-id`; clients may retain
+it for diagnostics but MUST NOT assign it semantic meaning.
 `503/server_shutting_down` means no new work should be submitted and MUST NOT be
 retried against that process.
 
@@ -287,6 +290,16 @@ MUST replace the parent ID for subsequent operations on that branch. A fork
 inherits its parent session's `project_id`.
 
 ### 4.3 Providers and model catalogs
+
+Sessions expose `history_retention`: `forever`, `one_year`, `six_months`,
+`three_months`, or `one_month`. An omitted creation value is `forever`. Update
+it with `PATCH /api/v1/sessions/{session_id}/retention` and
+`{"history_retention":"three_months"}`. Retention cleanup only deletes whole
+terminal session trees; it never removes individual events.
+
+`GET /api/v1/metrics` returns content-safe, process-lifetime counters. Trigger
+a consistent local SQLite backup with `POST /api/v1/storage/backups`; the API
+returns its private file name and byte count, never its absolute path.
 
 `GET /api/v1/providers` returns:
 

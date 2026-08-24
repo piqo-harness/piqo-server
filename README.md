@@ -630,6 +630,18 @@ curl -N \
 
 ## Persistence and recovery
 
+Each session has a `history_retention` of `forever` (the default), `one_year`,
+`six_months`, `three_months`, or `one_month`. It can be selected during session
+creation or updated with `PATCH /api/v1/sessions/{id}/retention`; cleanup only
+removes terminal, expired session trees and never individual events.
+
+Create a consistent local SQLite backup through `POST /api/v1/storage/backups`
+or `piqo storage backup`. Backups are manual and private, written to
+`storage.backup_directory` or the configuration directory's `backups/` folder.
+Piqo verifies SQLite and foreign-key integrity at startup and refuses a corrupt
+database. `GET /api/v1/metrics` returns a content-safe process-lifetime JSON
+snapshot, and every HTTP response includes a generated `x-request-id`.
+
 Sessions, projection metadata, and semantic events are stored in SQLite. The
 full in-memory projection is rebuilt and checked against the append-only log.
 Event IDs are monotonically increasing within a session, making history suitable
