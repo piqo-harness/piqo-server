@@ -218,6 +218,25 @@ cargo run -p piqo-cli -- attach <session-id>
 Use `attach --json` to see the complete event objects instead of assistant text
 only. Stop an attached client with Ctrl-C; this does not cancel the active run.
 
+Inspect a run and resolve an interactive permission through the same public API
+used by external clients:
+
+```sh
+piqo action inspect <session-id> <run-id>
+piqo permission list <session-id> <run-id>
+piqo permission approve <session-id> <run-id> <request-id> --scope once
+piqo permission deny <session-id> <run-id> <request-id>
+```
+
+For provider-managed tool calls, submit arbitrary JSON explicitly:
+
+```sh
+piqo action result <session-id> <run-id> <call-id> '{"result":"value"}'
+```
+
+These commands do not have privileged access: they use the documented HTTP
+endpoints and respect the same bearer-token requirements as any client.
+
 ## Embedding the macOS sidecar
 
 The `piqo-server` binary is intended to be bundled inside a macOS application

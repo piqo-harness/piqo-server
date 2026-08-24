@@ -19,7 +19,7 @@ pub use permissions::{
     PermissionRule, PermissionScope, ToolRequest,
 };
 pub use session::{
-    AgentPhase, ContentBlock, MessageAuthor, MessageProjection, MessageRole, PermissionProjection,
-    ProjectionError, RunProjection, RunStatus, SessionPhase, SessionProjection, SessionState,
-    SessionTransitionError,
+    AgentPhase, AgentProjection, ContentBlock, MessageAuthor, MessageProjection, MessageRole,
+    PermissionProjection, ProjectionError, RunProjection, RunStatus, SessionPhase,
+    SessionProjection, SessionState, SessionTransitionError, ToolCallProjection,
 };

@@ -1,6 +1,18 @@
 # M8 — Interactive Client Readiness
 
-State: `not_started`
+State: `designing`
+
+## Recorded decisions
+
+- M8 is a capstone: it cannot move to `implementing` until M3 through M7 meet
+  their acceptance criteria. In particular, incomplete MCP fixture and
+  end-to-end coverage remains a gate.
+- API v1 changes are additive. OpenAPI is the sole generated-model input; Piqo
+  publishes versioned JSON workflow fixtures, not an SDK.
+- `GET /sessions/{session_id}` is the typed client snapshot. Its
+  `last_event_id` is an atomic SSE checkpoint for the included projection.
+- Client recovery is defined by a normative HTTP status/error-code table;
+  the error envelope is not extended with a category field.
 
 ## Outcome
 
@@ -24,6 +36,17 @@ A conforming client must be able to:
 - inspect parent/child agent activity;
 - understand compaction and context-limit failures;
 - distinguish recoverable, terminal, incompatible, and shutdown errors.
+
+## Contract audit matrix
+
+| Workflow | Read model / command | Stream or recovery signal |
+| --- | --- | --- |
+| Sidecar lifecycle | `ready`, `fatal`, health, OpenAPI | process exit and SSE EOF |
+| Projects, providers, models, agents | collection and detail routes | refresh after configuration mutation |
+| Sessions and runs | typed session snapshot, run inspection, queue commands | session SSE by event ID |
+| Tool and permission actions | tool-result and permission routes | tool/permission/run events |
+| Context and compaction | snapshot context projection | `context_*` events |
+| Child agents | typed agent tree and child snapshots | one SSE cursor per session |
 
 ## Implementation slices
 

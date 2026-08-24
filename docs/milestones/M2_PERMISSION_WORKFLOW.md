@@ -1,6 +1,6 @@
 # M2 — Permission Workflow
 
-State: `not_started`
+State: `complete`
 
 ## Outcome
 

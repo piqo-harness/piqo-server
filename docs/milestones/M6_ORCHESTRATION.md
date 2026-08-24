@@ -1,6 +1,6 @@
 # M6 — Orchestration and Subagents
 
-State: `not_started`
+State: `designing`
 
 ## Outcome
 
