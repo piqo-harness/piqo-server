@@ -2,8 +2,8 @@ use std::{collections::HashMap, path::Path, str::FromStr, sync::Arc, time::Durat
 
 use chrono::{SecondsFormat, Utc};
 use piqo_core::{
-    EventId, PermissionScope, ProjectionError, RecordedEvent, SemanticEvent, SessionPhase,
-    SessionProjection,
+    AgentBudget, EventId, PermissionScope, ProjectionError, RecordedEvent, SemanticEvent,
+    SessionPhase, SessionProjection,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -54,6 +54,21 @@ pub struct PermissionRuleRecord {
     pub project_id: Option<String>,
     pub agent_id: String,
     pub tool_name: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentLinkRecord {
+    pub instance_id: String,
+    pub profile_id: String,
+    pub parent_session_id: String,
+    pub parent_run_id: String,
+    pub parent_call_id: String,
+    pub child_session_id: String,
+    pub child_run_id: String,
+    pub depth: u8,
+    pub budget: AgentBudget,
+    pub permission_ceiling: Value,
     pub created_at: String,
 }
 
@@ -122,9 +137,58 @@ pub enum StoreError {
     PermissionRuleNotFound(String),
     #[error("permission scope is invalid for a durable rule")]
     InvalidPermissionScope,
+    #[error("agent delegation for tool call {0} already exists")]
+    AgentLinkConflict(String),
+    #[error("worker tracking state is poisoned")]
+    WorkerStatePoisoned,
 }
 
 impl SqliteStore {
+    pub async fn agent_links(&self, session_id: &str) -> Result<Vec<AgentLinkRecord>, StoreError> {
+        self.ensure_session(session_id).await?;
+        let rows = sqlx::query(
+            "SELECT instance_id, profile_id, parent_session_id, parent_run_id, parent_call_id,
+                    child_session_id, child_run_id, depth, budget, permission_ceiling, created_at
+             FROM agent_links WHERE parent_session_id = ? OR child_session_id = ?
+             ORDER BY created_at, instance_id",
+        )
+        .bind(session_id)
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(agent_link_from_row).collect()
+    }
+
+    pub(crate) async fn create_agent_link(
+        &self,
+        record: &AgentLinkRecord,
+    ) -> Result<(), StoreError> {
+        let result = sqlx::query(
+            "INSERT INTO agent_links (instance_id, profile_id, parent_session_id, parent_run_id,
+                 parent_call_id, child_session_id, child_run_id, depth, budget, permission_ceiling, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&record.instance_id)
+        .bind(&record.profile_id)
+        .bind(&record.parent_session_id)
+        .bind(&record.parent_run_id)
+        .bind(&record.parent_call_id)
+        .bind(&record.child_session_id)
+        .bind(&record.child_run_id)
+        .bind(i64::from(record.depth))
+        .bind(serde_json::to_string(&record.budget)?)
+        .bind(serde_json::to_string(&record.permission_ceiling)?)
+        .bind(&record.created_at)
+        .execute(&self.pool)
+        .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) if error.as_database_error().is_some() => {
+                Err(StoreError::AgentLinkConflict(record.parent_call_id.clone()))
+            }
+            Err(error) => Err(StoreError::Database(error)),
+        }
+    }
     pub async fn permission_rules(&self) -> Result<Vec<PermissionRuleRecord>, StoreError> {
         sqlx::query(
             "SELECT id, scope, session_id, project_id, agent_id, tool_name, created_at
@@ -969,6 +1033,27 @@ fn permission_rule_from_row(
         project_id: row.try_get("project_id")?,
         agent_id: row.try_get("agent_id")?,
         tool_name: row.try_get("tool_name")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+fn agent_link_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<AgentLinkRecord, StoreError> {
+    Ok(AgentLinkRecord {
+        instance_id: row.try_get("instance_id")?,
+        profile_id: row.try_get("profile_id")?,
+        parent_session_id: row.try_get("parent_session_id")?,
+        parent_run_id: row.try_get("parent_run_id")?,
+        parent_call_id: row.try_get("parent_call_id")?,
+        child_session_id: row.try_get("child_session_id")?,
+        child_run_id: row.try_get("child_run_id")?,
+        depth: u8::try_from(row.try_get::<i64, _>("depth")?).map_err(|_| {
+            StoreError::CorruptSession {
+                session_id: "agent_link".to_owned(),
+                reason: "invalid agent link depth".to_owned(),
+            }
+        })?,
+        budget: serde_json::from_str(&row.try_get::<String, _>("budget")?)?,
+        permission_ceiling: serde_json::from_str(&row.try_get::<String, _>("permission_ceiling")?)?,
         created_at: row.try_get("created_at")?,
     })
 }

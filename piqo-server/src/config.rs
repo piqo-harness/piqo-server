@@ -37,8 +37,81 @@ pub struct PiqoConfig {
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
     #[serde(default)]
     pub context: ContextConfig,
+    #[serde(default)]
+    pub orchestration: OrchestrationConfig,
     #[serde(skip)]
     markdown_agents: HashMap<String, AgentDefinition>,
+}
+
+fn default_child_depth() -> u8 {
+    1
+}
+fn default_tree_concurrency() -> usize {
+    2
+}
+fn default_global_concurrency() -> usize {
+    4
+}
+fn default_child_turns() -> u32 {
+    32
+}
+fn default_child_duration() -> u64 {
+    600
+}
+fn default_tree_duration() -> u64 {
+    1_800
+}
+fn default_tree_tokens() -> u64 {
+    262_144
+}
+fn default_orchestration_bytes() -> usize {
+    65_536
+}
+fn default_context_items() -> usize {
+    32
+}
+
+/// Hard limits for managed child-agent work.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrchestrationConfig {
+    #[serde(default = "default_child_depth")]
+    pub max_depth: u8,
+    #[serde(default = "default_tree_concurrency")]
+    pub max_concurrent_per_tree: usize,
+    #[serde(default = "default_global_concurrency")]
+    pub max_concurrent_global: usize,
+    #[serde(default = "default_child_turns")]
+    pub max_child_model_turns: u32,
+    #[serde(default = "default_child_duration")]
+    pub max_child_duration_seconds: u64,
+    #[serde(default = "default_tree_duration")]
+    pub max_tree_duration_seconds: u64,
+    #[serde(default = "default_tree_tokens")]
+    pub max_tree_tokens: u64,
+    #[serde(default = "default_orchestration_bytes")]
+    pub max_context_bytes: usize,
+    #[serde(default = "default_context_items")]
+    pub max_context_message_ids: usize,
+    #[serde(default = "default_orchestration_bytes")]
+    pub max_result_bytes: usize,
+}
+
+impl Default for OrchestrationConfig {
+    fn default() -> Self {
+        Self {
+            max_depth: default_child_depth(),
+            max_concurrent_per_tree: default_tree_concurrency(),
+            max_concurrent_global: default_global_concurrency(),
+            max_child_model_turns: default_child_turns(),
+            max_child_duration_seconds: default_child_duration(),
+            max_tree_duration_seconds: default_tree_duration(),
+            max_tree_tokens: default_tree_tokens(),
+            max_context_bytes: default_orchestration_bytes(),
+            max_context_message_ids: default_context_items(),
+            max_result_bytes: default_orchestration_bytes(),
+        }
+    }
 }
 
 fn default_context_window_tokens() -> u64 {
@@ -456,6 +529,8 @@ pub enum ConfigError {
     InvalidNativeTools(String),
     #[error("invalid MCP server configuration: {0}")]
     InvalidMcp(String),
+    #[error("invalid orchestration configuration: {0}")]
+    InvalidOrchestration(String),
     #[error("configuration is read-only in this server instance")]
     ReadOnly,
     #[error("configuration state lock was poisoned")]
@@ -548,6 +623,22 @@ impl PiqoConfig {
             provider.validate(name)?;
         }
         self.native_tools.validate()?;
+        let orchestration = &self.orchestration;
+        if orchestration.max_depth == 0
+            || orchestration.max_concurrent_per_tree == 0
+            || orchestration.max_concurrent_global == 0
+            || orchestration.max_child_model_turns == 0
+            || orchestration.max_child_duration_seconds == 0
+            || orchestration.max_tree_duration_seconds == 0
+            || orchestration.max_tree_tokens == 0
+            || orchestration.max_context_bytes == 0
+            || orchestration.max_context_message_ids == 0
+            || orchestration.max_result_bytes == 0
+        {
+            return Err(ConfigError::InvalidOrchestration(
+                "all limits must be greater than zero".to_owned(),
+            ));
+        }
         if self.context.fallback_context_window_tokens == 0
             || self.context.fallback_output_reserve_tokens == 0
             || self.context.fallback_output_reserve_tokens

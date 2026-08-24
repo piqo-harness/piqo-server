@@ -203,6 +203,7 @@ async fn openapi_documents_run_and_queue_routes() {
         ("/api/v1/sessions/{session_id}/events", "get"),
         ("/api/v1/sessions/{session_id}/events/stream", "get"),
         ("/api/v1/sessions/{session_id}/forks", "post"),
+        ("/api/v1/sessions/{session_id}/agent-tree", "get"),
         ("/api/v1/providers", "get"),
         ("/api/v1/providers", "post"),
         ("/api/v1/agents", "get"),

@@ -417,6 +417,14 @@ front-matter makes the configuration invalid.
 `provider`, `model`, `instructions`, individual `permissions`, and
 `body`. The Markdown body layer precedes the TOML body layer.
 
+Named agents may expose Piqo's managed `delegate` tool through
+`permissions.tools.delegate`. Its arguments are a configured child `agent`, a
+`task`, and explicit `context_message_ids` from the parent session. A child has
+its own linked session and SSE stream. `GET
+/api/v1/sessions/{session_id}/agent-tree` returns links involving a session;
+clients MUST use each child session's own cursor and MUST NOT infer a global
+ordering across sessions.
+
 ### 4.5 Queue a run
 
 ```http
@@ -592,6 +600,7 @@ tool_execution_started          tool_result
 agent_phase_changed
 permission_requested            permission_resolved
 agent_spawned                   agent_finished
+agent_context_captured          agent_result_delivered
 context_fact_recorded           context_compaction_started
 context_compacted               context_compaction_failed
 context_compaction_bypassed

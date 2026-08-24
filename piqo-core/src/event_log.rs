@@ -3,8 +3,9 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-    AgentPhase, CompactionStrategy, ContentBlock, ContextArtifact, ContextFact, MessageAuthor,
-    MessageRole, PermissionDecision, PermissionDecisionSource, PermissionScope, SessionPhase,
+    AgentLink, AgentPhase, AgentResult, CompactionStrategy, ContentBlock, ContextArtifact,
+    ContextFact, DelegatedContextRef, MessageAuthor, MessageRole, PermissionDecision,
+    PermissionDecisionSource, PermissionScope, SessionPhase,
 };
 
 /// Monotonically increasing identifier assigned to a recorded event.
@@ -146,9 +147,25 @@ pub enum SemanticEvent {
     AgentSpawned {
         agent_id: String,
         parent_id: Option<String>,
+        #[serde(default)]
+        link: Option<AgentLink>,
+        #[serde(default)]
+        config_revision: Option<u64>,
     },
     AgentFinished {
         agent_id: String,
+        #[serde(default)]
+        result: Option<AgentResult>,
+    },
+    AgentContextCaptured {
+        agent_id: String,
+        references: Vec<DelegatedContextRef>,
+    },
+    AgentResultDelivered {
+        agent_id: String,
+        parent_run_id: String,
+        parent_call_id: String,
+        result: AgentResult,
     },
     ContextFactRecorded {
         fact: ContextFact,
@@ -280,13 +297,15 @@ mod tests {
         let mut log = EventLog::new();
         assert_eq!(
             log.append(SemanticEvent::AgentFinished {
-                agent_id: "a".into()
+                agent_id: "a".into(),
+                result: None,
             }),
             1
         );
         assert_eq!(
             log.append(SemanticEvent::AgentFinished {
-                agent_id: "b".into()
+                agent_id: "b".into(),
+                result: None,
             }),
             2
         );
@@ -300,9 +319,11 @@ mod tests {
         let mut log = EventLog::new();
         log.append(SemanticEvent::AgentFinished {
             agent_id: "a".into(),
+            result: None,
         });
         log.append(SemanticEvent::AgentFinished {
             agent_id: "b".into(),
+            result: None,
         });
 
         let branch = log.fork_at(1).expect("event 1 was appended above");

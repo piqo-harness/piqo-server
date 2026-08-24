@@ -48,14 +48,16 @@ use utoipa::{Modify, OpenApi, ToSchema};
 pub use config::{
     AgentConfigOverride, AgentDefinition, AgentPermissions, ConfigError, ConfigManager,
     ConfigSnapshot, CreateProviderRequest, DiscoveryStatus, ModelDiscovery, ModelSource,
-    PermissionSetting, PiqoConfig, ProviderCatalogEntry, ProviderConfig, ProviderCredentialInput,
-    ProviderCredentialSummary, ProviderModelsResponse, ReplaceProviderModelsRequest,
-    UpdateProviderRequest,
+    OrchestrationConfig, PermissionSetting, PiqoConfig, ProviderCatalogEntry, ProviderConfig,
+    ProviderCredentialInput, ProviderCredentialSummary, ProviderModelsResponse,
+    ReplaceProviderModelsRequest, UpdateProviderRequest,
 };
 pub use runtime::{
     ensure_private_directory, prepare_server, PreparedServer, ServerError, ServerOptions,
 };
-pub use storage::{Project, SessionSummary, SqliteStore, StoreError, EVENT_SCHEMA_VERSION};
+pub use storage::{
+    AgentLinkRecord, Project, SessionSummary, SqliteStore, StoreError, EVENT_SCHEMA_VERSION,
+};
 use supervisor::EventHub;
 pub use supervisor::{RunRequest, SessionSupervisor};
 
@@ -417,6 +419,12 @@ pub struct RunAcceptedResponse {
 pub struct RunResponse {
     pub session_id: String,
     pub run: ApiRun,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AgentTreeResponse {
+    pub session_id: String,
+    pub links: Vec<Value>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -823,6 +831,10 @@ pub fn router_with_token(state: AppState, token: Option<String>) -> Router {
             get(stream_events),
         )
         .route("/api/v1/sessions/{session_id}/forks", post(fork_session))
+        .route(
+            "/api/v1/sessions/{session_id}/agent-tree",
+            get(get_agent_tree),
+        )
         .route(
             "/api/v1/providers",
             get(list_providers).post(create_provider),
@@ -1627,6 +1639,29 @@ async fn get_run(
 }
 
 #[utoipa::path(
+    get,
+    path = "/api/v1/sessions/{session_id}/agent-tree",
+    params(("session_id" = String, Path)),
+    responses((status = 200, body = AgentTreeResponse), (status = 404, body = ErrorResponse))
+)]
+async fn get_agent_tree(
+    State(state): State<AppState>,
+    ApiPath(session_id): ApiPath<String>,
+) -> Result<Json<AgentTreeResponse>, ApiError> {
+    Ok(Json(AgentTreeResponse {
+        links: state
+            .store()
+            .agent_links(&session_id)
+            .await?
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<Result<_, _>>()
+            .map_err(StoreError::Json)?,
+        session_id,
+    }))
+}
+
+#[utoipa::path(
     post,
     path = "/api/v1/sessions/{session_id}/runs/{run_id}/cancel",
     params(("session_id" = String, Path), ("run_id" = String, Path)),
@@ -1849,6 +1884,7 @@ fn event_for_sse(event: RecordedEvent) -> Event {
         get_events,
         stream_events,
         fork_session,
+        get_agent_tree,
         list_providers,
         list_agents,
         create_provider,
@@ -1890,6 +1926,7 @@ fn event_for_sse(event: RecordedEvent) -> Event {
         ApprovePermissionRequest,
         RunAcceptedResponse,
         RunResponse,
+        AgentTreeResponse,
         ApiRun,
         ProviderCatalogResponse,
         AgentCatalogResponse,
