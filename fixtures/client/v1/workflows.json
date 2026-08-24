@@ -1,0 +1,55 @@
+{
+  "fixture_format_version": 1,
+  "scenarios": [
+    {
+      "name": "conversation_usage",
+      "http": [{"request": "POST /api/v1/sessions/{session_id}/runs", "response_status": 202}],
+      "sse": [
+        "id: 12\nevent: run_completed\ndata: {\"id\":12,\"session_id\":\"session\",\"schema_version\":1,\"occurred_at\":\"2026-08-24T00:00:00Z\",\"type\":\"run_completed\",\"data\":{\"run_id\":\"run\",\"usage\":{\"total_tokens\":12}}}\n\n"
+      ],
+      "expected_checkpoint": 12
+    },
+    {
+      "name": "client_tool_result",
+      "http": [{"request": "POST /api/v1/sessions/{session_id}/runs/{run_id}/tool_calls/{call_id}/result", "response_status": 202}],
+      "sse": ["id: 20\nevent: tool_result\ndata: {\"id\":20,\"type\":\"tool_result\",\"data\":{\"run_id\":\"run\",\"call_id\":\"call\",\"result\":{\"ok\":true}}}\n\n"],
+      "expected_checkpoint": 20
+    },
+    {
+      "name": "permission_resolution",
+      "http": [{"request": "GET /api/v1/sessions/{session_id}/runs/{run_id}/permission_requests", "response_status": 200}, {"request": "POST /api/v1/sessions/{session_id}/runs/{run_id}/permission_requests/{request_id}/approve", "response_status": 202}],
+      "sse": ["id: 31\nevent: permission_resolved\ndata: {\"id\":31,\"type\":\"permission_resolved\",\"data\":{\"request_id\":\"request\",\"decision\":\"allow\"}}\n\n"],
+      "expected_checkpoint": 31
+    },
+    {
+      "name": "cancel_retry_resume",
+      "http": [{"request": "POST /api/v1/sessions/{session_id}/runs/{run_id}/cancel", "response_status": 202}, {"request": "POST /api/v1/sessions/{session_id}/runs/{run_id}/retries", "response_status": 202}, {"request": "POST /api/v1/sessions/{session_id}/queue/resume", "response_status": 202}],
+      "sse": ["id: 40\nevent: run_cancelled\ndata: {\"id\":40,\"type\":\"run_cancelled\",\"data\":{\"run_id\":\"run\"}}\n\n"],
+      "expected_checkpoint": 40
+    },
+    {
+      "name": "compaction",
+      "http": [{"request": "GET /api/v1/sessions/{session_id}", "response_status": 200}],
+      "sse": ["id: 51\nevent: context_compaction_failed\ndata: {\"id\":51,\"type\":\"context_compaction_failed\",\"data\":{\"run_id\":\"run\",\"artifact_id\":\"artifact\",\"code\":\"context_compaction_failed\"}}\n\n"],
+      "expected_checkpoint": 51
+    },
+    {
+      "name": "agent_tree",
+      "http": [{"request": "GET /api/v1/sessions/{session_id}/agent-tree", "response_status": 200}],
+      "sse": ["id: 60\nevent: agent_finished\ndata: {\"id\":60,\"type\":\"agent_finished\",\"data\":{\"agent_id\":\"child\"}}\n\n"],
+      "expected_checkpoint": 60
+    },
+    {
+      "name": "shutdown",
+      "http": [{"request": "POST /api/v1/sessions/{session_id}/runs", "response_status": 503, "error_code": "server_shutting_down"}],
+      "sse": ["id: 70\nevent: run_interrupted\ndata: {\"id\":70,\"type\":\"run_interrupted\",\"data\":{\"run_id\":\"run\",\"reason\":\"server_shutdown\"}}\n\n"],
+      "expected_checkpoint": 70
+    },
+    {
+      "name": "compatibility_additive",
+      "http": [{"request": "GET /api/v1/sessions/{session_id}", "response_status": 200, "unknown_response_field": true}],
+      "sse": ["id: 80\nevent: future_event\ndata: {\"id\":80,\"type\":\"future_event\",\"schema_version\":2,\"future_field\":true,\"data\":{\"future_data\":true}}\n\n"],
+      "expected_checkpoint": 80
+    }
+  ]
+}

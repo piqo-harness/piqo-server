@@ -98,7 +98,7 @@ changes state; detailed task tracking belongs in an issue or pull request.
 | M5 | implementing | — | 2026-08-21 | Durable context budgets and compaction under implementation. |
 | M6 | designing | — | 2026-08-23 | Linked-session delegation, durable agent links, and tree inspection are being designed; implementation remains gated on M3 and M5 contracts. |
 | M7 | implementing | — | 2026-08-24 | Resource, storage, and observability hardening implementation started; completion remains gated on M3–M6 acceptance. |
-| M8 | not_started | — | — | — |
+| M8 | designing | — | 2026-08-24 | Client-contract design is in progress; implementation remains gated on M3–M7 completion. |
 
 ## Definition of ready
 

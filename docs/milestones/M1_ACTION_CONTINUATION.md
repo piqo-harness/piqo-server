@@ -1,6 +1,6 @@
 # M1 — Action Continuation Protocol
 
-State: `not_started`
+State: `complete`
 
 ## Outcome
 

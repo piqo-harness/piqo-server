@@ -197,6 +197,22 @@ The client MUST require `status == "ok"` and `api_version == "v1"`. The
 authenticated OpenAPI document is available at `GET /api/v1/openapi.json` and
 is the schema reference for generated request/response models.
 
+### 3.2 Error actions
+
+The error envelope is intentionally small and extensible. Clients MUST combine
+the HTTP status with `error.code`; they MUST NOT branch on `message`.
+
+| Action | HTTP status and stable codes |
+| --- | --- |
+| Correct input or selection | `400/invalid_request`, `400/invalid_cursor`, `400/invalid_permission_scope`, `400/agent_not_found`, `409/provider_already_exists`, `422/config_invalid` |
+| Refresh local state and let the user retry | `404/session_not_found`, `404/project_not_found`, `404/run_not_found`, `404/tool_call_not_found`, `404/event_not_found`, `404/provider_not_found`, `409/conflict`, `409/invalid_transition`, `409/queue_paused`, `409/project_deleting`, `409/project_path_conflict`, `409/tool_result_conflict`, `409/tool_call_wrong_run` |
+| Wait and retry with bounded backoff | `429/run_capacity_exceeded`, `429/sse_capacity_exceeded`, `503/provider_unavailable`, `503/configuration_unavailable`, `503/configuration_read_only`, `503/storage_unavailable` |
+| Show a terminal operation result | `409/caller_owned_transcript`, `409/native_tool_managed`, `409/mcp_tool_managed`, `409/manual_model_override`, `409/backup_unavailable`, `502/provider_protocol_error` |
+| Recreate or stop using this process | `401/unauthorized`, `503/server_shutting_down`, `503/server_shutdown_timeout`, malformed or unknown sidecar protocol data |
+
+Unknown codes are structured failures. A client MAY show their message, but MUST
+not assume retryability or compatibility from the message text.
+
 ## 4. Core API workflow
 
 The normal client sequence is:
@@ -272,7 +288,10 @@ must identify an existing project. Success is `201` with a session summary:
 ```
 
 `GET /api/v1/sessions/{session_id}` returns the same summary with a populated
-`projection`. `GET /api/v1/sessions?limit=50&cursor=<opaque>` lists sessions;
+`projection`. The projection is a typed OpenAPI model containing messages,
+runs and their tool calls/results/usage, pending permissions, agent instances,
+queue state, and compaction state. Provider request, argument, result, usage,
+and JSON content values remain opaque JSON. `GET /api/v1/sessions?limit=50&cursor=<opaque>` lists sessions;
 `limit` is clamped to `1...200`, and `next_cursor: null` means the list is
 complete. Cursors are opaque and MUST NOT be decoded or manufactured.
 
@@ -535,7 +554,21 @@ means `after=0`. IDs are unsigned decimal integers, monotonically increasing
 within one session. A client MAY use this endpoint to resynchronize after an
 SSE parsing or transport failure.
 
-### 5.2 Live stream
+### 5.2 Snapshot-to-stream handoff
+
+For a late join, a client MUST first load `GET /sessions/{session_id}` and use
+its `last_event_id` as the `Last-Event-ID` of the stream request. The server
+constructs the summary and projection from one SQLite read transaction, so the
+checkpoint exactly describes the included projection. The stream subscribes
+before it reads durable replay: an event committed during replay is delivered
+from the live receiver and is filtered by its ID if it was also replayed.
+
+After a successful snapshot, apply only events whose ID is greater than that
+checkpoint. Persist the new checkpoint only after the full event has been
+applied. This creates a race-free, at-least-once handoff without reading SQLite
+or server internals.
+
+### 5.3 Live stream
 
 Open:
 
@@ -581,7 +614,12 @@ event types, unknown `data` fields, and a higher event `schema_version` by
 retaining or ignoring what they do not understand rather than terminating the
 whole stream.
 
-### 5.3 Event schema
+When the in-process live receiver falls behind, the server rereads durable
+events after its last emitted ID and continues the same SSE connection in
+order. If that reread fails, the stream closes; the client follows its normal
+reconnect procedure using its own checkpoint.
+
+### 5.4 Event schema
 
 Every event JSON object has this envelope:
 
@@ -738,3 +776,12 @@ A generated client is not conforming until automated tests cover:
 For integration tests, launch the real binary with a temporary `HOME` and a
 simulated provider. Never point destructive tests at the user's actual
 `~/.config/piqo` profile.
+
+## 9. Fixtures and generation
+
+OpenAPI v1 is the sole source for generated client models. The repository also
+ships portable, versioned workflow scenarios under `fixtures/client/v1/`.
+Each JSON file includes its fixture format version, HTTP exchanges, exact SSE
+frames, and expected client checkpoints. They are deterministic compatibility
+inputs, not a second API specification. Fixtures intentionally include unknown
+additive fields and event types; conforming clients must continue processing.

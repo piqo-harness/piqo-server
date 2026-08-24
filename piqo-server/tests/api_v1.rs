@@ -102,6 +102,36 @@ async fn json_body(response: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).expect("JSON response")
 }
 
+#[test]
+fn client_fixture_pack_is_versioned_and_covers_additive_compatibility() {
+    let manifest: Value =
+        serde_json::from_str(include_str!("../../fixtures/client/v1/manifest.json"))
+            .expect("fixture manifest decodes");
+    let workflows: Value =
+        serde_json::from_str(include_str!("../../fixtures/client/v1/workflows.json"))
+            .expect("workflow fixtures decode");
+    assert_eq!(manifest["fixture_format_version"], 1);
+    assert_eq!(manifest["api_version"], "v1");
+    assert_eq!(
+        workflows["scenarios"]
+            .as_array()
+            .expect("scenarios are an array")
+            .len(),
+        manifest["scenarios"]
+            .as_array()
+            .expect("manifest scenarios")
+            .len()
+    );
+    assert!(workflows["scenarios"]
+        .as_array()
+        .expect("scenarios")
+        .iter()
+        .any(|scenario| scenario["name"] == "compatibility_additive"
+            && scenario["sse"][0]
+                .as_str()
+                .is_some_and(|frame| frame.contains("future_event"))));
+}
+
 #[tokio::test]
 async fn lists_sessions_with_the_default_page_size() {
     let (app, _file) = app().await;

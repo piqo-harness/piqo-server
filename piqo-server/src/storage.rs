@@ -74,6 +74,15 @@ pub struct SessionSummary {
     pub history_retention: HistoryRetention,
 }
 
+/// A session summary and projection reconstructed from the same SQLite read
+/// transaction. `summary.last_event_id` is therefore a safe SSE checkpoint for
+/// the returned projection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionSnapshot {
+    pub summary: SessionSummary,
+    pub projection: SessionProjection,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
@@ -463,6 +472,43 @@ impl SqliteStore {
         .await?
         .ok_or_else(|| StoreError::SessionNotFound(session_id.to_owned()))?;
         summary_from_row(&row)
+    }
+
+    pub async fn session_snapshot(&self, session_id: &str) -> Result<SessionSnapshot, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT id, title, project_id, parent_session_id, forked_at_event_id, created_at, updated_at,
+                    phase, revision, last_event_id, history_retention
+             FROM sessions WHERE id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| StoreError::SessionNotFound(session_id.to_owned()))?;
+        let summary = summary_from_row(&row)?;
+        let rows = sqlx::query(
+            "SELECT event_id, schema_version, type, data, occurred_at
+             FROM events WHERE session_id = ? ORDER BY event_id ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        let events = rows
+            .iter()
+            .map(|event| recorded_from_row(session_id, event))
+            .collect::<Result<Vec<_>, _>>()?;
+        let projection = project(session_id, &events)?;
+        transaction.commit().await?;
+        if projection.state.last_event_id != Some(summary.last_event_id) {
+            return Err(StoreError::CorruptSession {
+                session_id: session_id.to_owned(),
+                reason: "session summary and event projection disagree on last event id".to_owned(),
+            });
+        }
+        Ok(SessionSnapshot {
+            summary,
+            projection,
+        })
     }
 
     pub async fn update_session_retention(
@@ -1274,6 +1320,34 @@ mod tests {
             .expect("session loads");
         assert_eq!(loaded.phase, SessionPhase::Running);
         assert_eq!(loaded.last_event_id, 2);
+    }
+
+    #[tokio::test]
+    async fn session_snapshot_uses_a_matching_projection_checkpoint() {
+        let (store, _file) = store().await;
+        let session = store
+            .create_session(Some("snapshot".into()), None)
+            .await
+            .expect("session creates");
+        store
+            .append_event(
+                &session.id,
+                SemanticEvent::SessionPhaseChanged {
+                    from: SessionPhase::Created,
+                    to: SessionPhase::Running,
+                    reason: None,
+                },
+            )
+            .await
+            .expect("phase change appends");
+
+        let snapshot = store
+            .session_snapshot(&session.id)
+            .await
+            .expect("snapshot loads");
+        assert_eq!(snapshot.summary.last_event_id, 2);
+        assert_eq!(snapshot.projection.state.last_event_id, Some(2));
+        assert_eq!(snapshot.projection.state.phase, SessionPhase::Running);
     }
 
     #[tokio::test]

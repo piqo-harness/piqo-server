@@ -96,6 +96,10 @@ pub struct RunProjection {
     pub attempt_id: Option<String>,
     pub attempts: u32,
     pub error: Option<String>,
+    /// Provider-reported usage from the completed attempt. Its shape remains
+    /// provider-owned and is therefore intentionally opaque JSON.
+    #[serde(default)]
+    pub usage: Option<serde_json::Value>,
     pub queue_priority: i64,
     #[serde(default)]
     pub tool_calls: BTreeMap<String, ToolCallProjection>,
@@ -474,6 +478,7 @@ impl SessionProjection {
                         attempt_id: None,
                         attempts: 0,
                         error: None,
+                        usage: None,
                         queue_priority: if retry_of.is_some() { -1 } else { 0 },
                         tool_calls: BTreeMap::new(),
                     },
@@ -500,8 +505,13 @@ impl SessionProjection {
                 run.attempts = *attempt;
                 self.queue_paused = false;
             }
-            crate::SemanticEvent::RunCompleted { run_id, .. } => {
+            crate::SemanticEvent::RunCompleted { run_id, usage } => {
                 self.set_run_terminal(run_id, RunStatus::Completed, None)?;
+                let run = self
+                    .runs
+                    .get_mut(run_id)
+                    .ok_or_else(|| ProjectionError::UnknownRun(run_id.clone()))?;
+                run.usage = usage.clone();
             }
             crate::SemanticEvent::RunAttemptStarted {
                 run_id,
@@ -860,6 +870,49 @@ mod tests {
             .expect("message completes");
         assert_eq!(projection.messages[0].blocks.len(), 1);
         assert_eq!(projection.runs["r"].status, RunStatus::Queued);
+    }
+
+    #[test]
+    fn retains_provider_usage_in_the_run_projection() {
+        let mut projection = SessionProjection::new("s");
+        projection
+            .apply(1, &crate::SemanticEvent::SessionCreated { title: None })
+            .expect("creation projects");
+        projection
+            .apply(
+                2,
+                &crate::SemanticEvent::RunQueued {
+                    run_id: "r".into(),
+                    retry_of: None,
+                    provider: "local".into(),
+                    model: "model".into(),
+                    request: serde_json::json!({}),
+                },
+            )
+            .expect("run queues");
+        projection
+            .apply(
+                3,
+                &crate::SemanticEvent::RunStarted {
+                    run_id: "r".into(),
+                    attempt_id: "a".into(),
+                    attempt: 1,
+                },
+            )
+            .expect("run starts");
+        projection
+            .apply(
+                4,
+                &crate::SemanticEvent::RunCompleted {
+                    run_id: "r".into(),
+                    usage: Some(serde_json::json!({"total_tokens": 12})),
+                },
+            )
+            .expect("run completes");
+        assert_eq!(
+            projection.runs["r"].usage,
+            Some(serde_json::json!({"total_tokens": 12}))
+        );
     }
 
     #[test]

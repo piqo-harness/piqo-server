@@ -6,6 +6,7 @@ mod storage;
 mod supervisor;
 
 use std::{
+    collections::BTreeMap,
     convert::Infallible,
     net::SocketAddr,
     path::PathBuf,
@@ -56,8 +57,8 @@ pub use runtime::{
     ensure_private_directory, prepare_server, PreparedServer, ServerError, ServerOptions,
 };
 pub use storage::{
-    AgentLinkRecord, HistoryRetention, Project, SessionSummary, SqliteStore, StoreError,
-    EVENT_SCHEMA_VERSION,
+    AgentLinkRecord, HistoryRetention, Project, SessionSnapshot, SessionSummary, SqliteStore,
+    StoreError, EVENT_SCHEMA_VERSION,
 };
 use supervisor::EventHub;
 pub use supervisor::{RunRequest, SessionSupervisor};
@@ -350,7 +351,7 @@ pub struct ApprovePermissionRequest {
     pub scope: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PermissionRequestResponse {
     pub request_id: String,
     pub session_id: String,
@@ -359,10 +360,10 @@ pub struct PermissionRequestResponse {
     pub agent_id: String,
     pub tool_name: String,
     pub arguments: Value,
-    pub decision: Option<piqo_core::PermissionDecision>,
+    pub decision: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PermissionRequestsResponse {
     pub requests: Vec<PermissionRequestResponse>,
 }
@@ -412,7 +413,7 @@ pub struct SessionListResponse {
     pub next_cursor: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ApiSessionSummary {
     pub id: String,
     pub title: Option<String>,
@@ -425,7 +426,7 @@ pub struct ApiSessionSummary {
     pub revision: u64,
     pub last_event_id: EventId,
     pub history_retention: HistoryRetention,
-    pub projection: Value,
+    pub projection: Option<ApiSessionProjection>,
 }
 
 impl From<SessionSummary> for ApiSessionSummary {
@@ -442,9 +443,174 @@ impl From<SessionSummary> for ApiSessionSummary {
             revision: summary.revision,
             last_event_id: summary.last_event_id,
             history_retention: summary.history_retention,
-            projection: Value::Null,
+            projection: None,
         }
     }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApiSessionProjection {
+    pub state: ApiSessionState,
+    pub messages: Vec<ApiMessageProjection>,
+    pub agents: BTreeMap<String, String>,
+    pub agent_instances: BTreeMap<String, ApiAgentInstance>,
+    pub pending_permissions: BTreeMap<String, ApiPermissionRequest>,
+    pub runs: BTreeMap<String, ApiRun>,
+    pub queue_paused: bool,
+    pub context: ApiContextProjection,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApiSessionState {
+    pub session_id: String,
+    pub phase: String,
+    pub revision: u64,
+    pub last_event_id: Option<EventId>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApiMessageProjection {
+    pub message_id: String,
+    pub role: String,
+    pub agent_id: Option<String>,
+    pub author: ApiMessageAuthor,
+    pub blocks: Vec<ApiContentBlock>,
+    pub completed: bool,
+    pub interrupted: bool,
+    pub first_event_id: EventId,
+    pub last_event_id: EventId,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum ApiMessageAuthor {
+    System,
+    User,
+    Agent(String),
+    Tool(String),
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum ApiContentBlock {
+    Text(String),
+    Json(Value),
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApiToolCall {
+    pub call_id: String,
+    pub assistant_message_id: String,
+    pub agent_id: String,
+    pub tool_name: String,
+    pub arguments: Value,
+    pub raw_arguments: String,
+    pub native: bool,
+    pub execution_id: Option<String>,
+    pub result: Option<Value>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApiPermissionRequest {
+    pub request_id: String,
+    pub run_id: String,
+    pub call_id: Option<String>,
+    pub agent_id: String,
+    pub tool_name: String,
+    pub arguments: Value,
+    pub decision: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApiAgentBudget {
+    pub max_model_turns: u32,
+    pub max_duration_seconds: u64,
+    pub max_tree_duration_seconds: u64,
+    pub max_tree_tokens: u64,
+    pub max_context_bytes: u64,
+    pub max_result_bytes: u64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApiAgentLink {
+    pub instance_id: String,
+    pub profile_id: String,
+    pub parent_session_id: String,
+    pub parent_run_id: String,
+    pub parent_call_id: String,
+    pub child_session_id: String,
+    pub child_run_id: String,
+    pub depth: u8,
+    pub budget: ApiAgentBudget,
+    pub permission_ceiling: Value,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApiDelegatedContextRef {
+    pub source_session_id: String,
+    pub message_id: String,
+    pub last_event_id: EventId,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApiAgentResult {
+    pub instance_id: String,
+    pub profile_id: String,
+    pub child_session_id: String,
+    pub child_run_id: String,
+    pub status: String,
+    pub output: Option<Value>,
+    pub output_truncated: bool,
+    pub usage: Option<Value>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApiAgentInstance {
+    pub agent_id: String,
+    pub parent_id: Option<String>,
+    pub link: Option<ApiAgentLink>,
+    pub config_revision: Option<u64>,
+    pub context: Vec<ApiDelegatedContextRef>,
+    pub result: Option<ApiAgentResult>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApiContextFact {
+    pub fact_id: String,
+    pub value: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApiToolCorrelation {
+    pub call_id: String,
+    pub tool_name: String,
+    pub run_id: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApiContextArtifact {
+    pub artifact_id: String,
+    pub supersedes_artifact_id: Option<String>,
+    pub strategy: String,
+    pub strategy_version: u16,
+    pub source_start_event_id: EventId,
+    pub source_end_event_id: EventId,
+    pub context_window_tokens: u64,
+    pub output_reserve_tokens: u64,
+    pub estimated_input_tokens: u64,
+    pub target_input_tokens: u64,
+    pub estimator_version: String,
+    pub summary: String,
+    pub tool_correlations: Vec<ApiToolCorrelation>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApiContextProjection {
+    pub durable_facts: Vec<ApiContextFact>,
+    pub active_artifact: Option<ApiContextArtifact>,
+    pub last_failure: Option<String>,
+    pub last_bypass_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -496,7 +662,40 @@ pub struct RunResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AgentTreeResponse {
     pub session_id: String,
-    pub links: Vec<Value>,
+    pub links: Vec<ApiAgentTreeLink>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApiAgentTreeLink {
+    pub instance_id: String,
+    pub profile_id: String,
+    pub parent_session_id: String,
+    pub parent_run_id: String,
+    pub parent_call_id: String,
+    pub child_session_id: String,
+    pub child_run_id: String,
+    pub depth: u8,
+    pub budget: ApiAgentBudget,
+    pub permission_ceiling: Value,
+    pub created_at: String,
+}
+
+impl From<AgentLinkRecord> for ApiAgentTreeLink {
+    fn from(link: AgentLinkRecord) -> Self {
+        Self {
+            instance_id: link.instance_id,
+            profile_id: link.profile_id,
+            parent_session_id: link.parent_session_id,
+            parent_run_id: link.parent_run_id,
+            parent_call_id: link.parent_call_id,
+            child_session_id: link.child_session_id,
+            child_run_id: link.child_run_id,
+            depth: link.depth,
+            budget: ApiAgentBudget::from(&link.budget),
+            permission_ceiling: link.permission_ceiling,
+            created_at: link.created_at,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -510,6 +709,10 @@ pub struct ApiRun {
     pub attempt_id: Option<String>,
     pub attempts: u32,
     pub error: Option<String>,
+    /// Provider-owned usage data from the completed run, if the provider sent it.
+    pub usage: Option<Value>,
+    pub queue_priority: i64,
+    pub tool_calls: BTreeMap<String, ApiToolCall>,
 }
 
 impl From<&RunProjection> for ApiRun {
@@ -524,6 +727,246 @@ impl From<&RunProjection> for ApiRun {
             attempt_id: run.attempt_id.clone(),
             attempts: run.attempts,
             error: run.error.clone(),
+            usage: run.usage.clone(),
+            queue_priority: run.queue_priority,
+            tool_calls: run
+                .tool_calls
+                .iter()
+                .map(|(call_id, call)| (call_id.clone(), ApiToolCall::from(call)))
+                .collect(),
+        }
+    }
+}
+
+impl From<&piqo_core::ToolCallProjection> for ApiToolCall {
+    fn from(call: &piqo_core::ToolCallProjection) -> Self {
+        Self {
+            call_id: call.call_id.clone(),
+            assistant_message_id: call.assistant_message_id.clone(),
+            agent_id: call.agent_id.clone(),
+            tool_name: call.tool_name.clone(),
+            arguments: call.arguments.clone(),
+            raw_arguments: call.raw_arguments.clone(),
+            native: call.native,
+            execution_id: call.execution_id.clone(),
+            result: call.result.clone(),
+        }
+    }
+}
+
+impl From<&piqo_core::SessionProjection> for ApiSessionProjection {
+    fn from(projection: &piqo_core::SessionProjection) -> Self {
+        Self {
+            state: ApiSessionState {
+                session_id: projection.state.session_id.clone(),
+                phase: session_phase_name(projection.state.phase).to_owned(),
+                revision: projection.state.revision,
+                last_event_id: projection.state.last_event_id,
+            },
+            messages: projection
+                .messages
+                .iter()
+                .map(ApiMessageProjection::from)
+                .collect(),
+            agents: projection
+                .agents
+                .iter()
+                .map(|(agent_id, phase)| (agent_id.clone(), agent_phase_name(*phase).to_owned()))
+                .collect(),
+            agent_instances: projection
+                .agent_instances
+                .iter()
+                .map(|(agent_id, instance)| (agent_id.clone(), ApiAgentInstance::from(instance)))
+                .collect(),
+            pending_permissions: projection
+                .pending_permissions
+                .iter()
+                .map(|(request_id, request)| {
+                    (request_id.clone(), ApiPermissionRequest::from(request))
+                })
+                .collect(),
+            runs: projection
+                .runs
+                .iter()
+                .map(|(run_id, run)| (run_id.clone(), ApiRun::from(run)))
+                .collect(),
+            queue_paused: projection.queue_paused,
+            context: ApiContextProjection::from(&projection.context),
+        }
+    }
+}
+
+impl From<&piqo_core::MessageProjection> for ApiMessageProjection {
+    fn from(message: &piqo_core::MessageProjection) -> Self {
+        Self {
+            message_id: message.message_id.clone(),
+            role: message_role_name(message.role).to_owned(),
+            agent_id: message.agent_id.clone(),
+            author: ApiMessageAuthor::from(&message.author),
+            blocks: message.blocks.iter().map(ApiContentBlock::from).collect(),
+            completed: message.completed,
+            interrupted: message.interrupted,
+            first_event_id: message.first_event_id,
+            last_event_id: message.last_event_id,
+        }
+    }
+}
+
+impl From<&piqo_core::MessageAuthor> for ApiMessageAuthor {
+    fn from(author: &piqo_core::MessageAuthor) -> Self {
+        match author {
+            piqo_core::MessageAuthor::System => Self::System,
+            piqo_core::MessageAuthor::User => Self::User,
+            piqo_core::MessageAuthor::Agent(id) => Self::Agent(id.clone()),
+            piqo_core::MessageAuthor::Tool(id) => Self::Tool(id.clone()),
+        }
+    }
+}
+
+impl From<&piqo_core::ContentBlock> for ApiContentBlock {
+    fn from(block: &piqo_core::ContentBlock) -> Self {
+        match block {
+            piqo_core::ContentBlock::Text(value) => Self::Text(value.clone()),
+            piqo_core::ContentBlock::Json(value) => Self::Json(value.clone()),
+        }
+    }
+}
+
+impl From<&piqo_core::PermissionProjection> for ApiPermissionRequest {
+    fn from(request: &piqo_core::PermissionProjection) -> Self {
+        Self {
+            request_id: request.request_id.clone(),
+            run_id: request.run_id.clone(),
+            call_id: request.call_id.clone(),
+            agent_id: request.agent_id.clone(),
+            tool_name: request.tool_name.clone(),
+            arguments: request.arguments.clone(),
+            decision: request
+                .decision
+                .map(permission_decision_name)
+                .map(str::to_owned),
+        }
+    }
+}
+
+impl From<&piqo_core::AgentProjection> for ApiAgentInstance {
+    fn from(agent: &piqo_core::AgentProjection) -> Self {
+        Self {
+            agent_id: agent.agent_id.clone(),
+            parent_id: agent.parent_id.clone(),
+            link: agent.link.as_ref().map(ApiAgentLink::from),
+            config_revision: agent.config_revision,
+            context: agent
+                .context
+                .iter()
+                .map(ApiDelegatedContextRef::from)
+                .collect(),
+            result: agent.result.as_ref().map(ApiAgentResult::from),
+        }
+    }
+}
+
+impl From<&piqo_core::AgentLink> for ApiAgentLink {
+    fn from(link: &piqo_core::AgentLink) -> Self {
+        Self {
+            instance_id: link.instance_id.clone(),
+            profile_id: link.profile_id.clone(),
+            parent_session_id: link.parent_session_id.clone(),
+            parent_run_id: link.parent_run_id.clone(),
+            parent_call_id: link.parent_call_id.clone(),
+            child_session_id: link.child_session_id.clone(),
+            child_run_id: link.child_run_id.clone(),
+            depth: link.depth,
+            budget: ApiAgentBudget::from(&link.budget),
+            permission_ceiling: link.permission_ceiling.clone(),
+        }
+    }
+}
+
+impl From<&piqo_core::AgentBudget> for ApiAgentBudget {
+    fn from(budget: &piqo_core::AgentBudget) -> Self {
+        Self {
+            max_model_turns: budget.max_model_turns,
+            max_duration_seconds: budget.max_duration_seconds,
+            max_tree_duration_seconds: budget.max_tree_duration_seconds,
+            max_tree_tokens: budget.max_tree_tokens,
+            max_context_bytes: budget.max_context_bytes,
+            max_result_bytes: budget.max_result_bytes,
+        }
+    }
+}
+
+impl From<&piqo_core::DelegatedContextRef> for ApiDelegatedContextRef {
+    fn from(reference: &piqo_core::DelegatedContextRef) -> Self {
+        Self {
+            source_session_id: reference.source_session_id.clone(),
+            message_id: reference.message_id.clone(),
+            last_event_id: reference.last_event_id,
+        }
+    }
+}
+
+impl From<&piqo_core::AgentResult> for ApiAgentResult {
+    fn from(result: &piqo_core::AgentResult) -> Self {
+        Self {
+            instance_id: result.instance_id.clone(),
+            profile_id: result.profile_id.clone(),
+            child_session_id: result.child_session_id.clone(),
+            child_run_id: result.child_run_id.clone(),
+            status: agent_terminal_status_name(result.status).to_owned(),
+            output: result.output.clone(),
+            output_truncated: result.output_truncated,
+            usage: result.usage.clone(),
+            error: result.error.clone(),
+        }
+    }
+}
+
+impl From<&piqo_core::ContextProjection> for ApiContextProjection {
+    fn from(context: &piqo_core::ContextProjection) -> Self {
+        Self {
+            durable_facts: context
+                .durable_facts
+                .iter()
+                .map(|fact| ApiContextFact {
+                    fact_id: fact.fact_id.clone(),
+                    value: fact.value.clone(),
+                })
+                .collect(),
+            active_artifact: context
+                .active_artifact
+                .as_ref()
+                .map(ApiContextArtifact::from),
+            last_failure: context.last_failure.clone(),
+            last_bypass_reason: context.last_bypass_reason.clone(),
+        }
+    }
+}
+
+impl From<&piqo_core::ContextArtifact> for ApiContextArtifact {
+    fn from(artifact: &piqo_core::ContextArtifact) -> Self {
+        Self {
+            artifact_id: artifact.artifact_id.clone(),
+            supersedes_artifact_id: artifact.supersedes_artifact_id.clone(),
+            strategy: compaction_strategy_name(artifact.strategy).to_owned(),
+            strategy_version: artifact.strategy_version,
+            source_start_event_id: artifact.source_start_event_id,
+            source_end_event_id: artifact.source_end_event_id,
+            context_window_tokens: artifact.context_window_tokens,
+            output_reserve_tokens: artifact.output_reserve_tokens,
+            estimated_input_tokens: artifact.estimated_input_tokens,
+            target_input_tokens: artifact.target_input_tokens,
+            estimator_version: artifact.estimator_version.clone(),
+            summary: artifact.summary.clone(),
+            tool_correlations: artifact
+                .tool_correlations
+                .iter()
+                .map(|correlation| ApiToolCorrelation {
+                    call_id: correlation.call_id.clone(),
+                    tool_name: correlation.tool_name.clone(),
+                    run_id: correlation.run_id.clone(),
+                })
+                .collect(),
         }
     }
 }
@@ -544,6 +987,48 @@ pub struct ConfigReloadResponse {
 pub struct BackupResponse {
     pub file_name: String,
     pub bytes: u64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApiMcpToolDefinition {
+    pub name: String,
+    pub server_id: String,
+    pub server_tool_name: String,
+    pub description: Option<String>,
+    pub input_schema: Value,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApiMcpServerDiagnostics {
+    pub id: String,
+    pub enabled: bool,
+    pub state: String,
+    pub tools: Vec<ApiMcpToolDefinition>,
+    pub last_error: Option<String>,
+    pub restart_attempts: u8,
+}
+
+impl From<piqo_tools::McpServerDiagnostics> for ApiMcpServerDiagnostics {
+    fn from(diagnostics: piqo_tools::McpServerDiagnostics) -> Self {
+        Self {
+            id: diagnostics.id,
+            enabled: diagnostics.enabled,
+            state: mcp_server_state_name(diagnostics.state).to_owned(),
+            tools: diagnostics
+                .tools
+                .into_iter()
+                .map(|tool| ApiMcpToolDefinition {
+                    name: tool.name,
+                    server_id: tool.server_id,
+                    server_tool_name: tool.server_tool_name,
+                    description: tool.description,
+                    input_schema: tool.input_schema,
+                })
+                .collect(),
+            last_error: diagnostics.last_error,
+            restart_attempts: diagnostics.restart_attempts,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1416,14 +1901,9 @@ async fn get_session(
     State(state): State<AppState>,
     ApiPath(session_id): ApiPath<String>,
 ) -> Result<Json<ApiSessionSummary>, ApiError> {
-    let summary = state.store.get_session(&session_id).await?;
-    let projection = state.store.projection(&session_id).await?;
-    let mut response = ApiSessionSummary::from(summary);
-    response.projection =
-        serde_json::to_value(projection).map_err(|error| ApiError::BadRequest {
-            code: "invalid_request",
-            message: error.to_string(),
-        })?;
+    let snapshot = state.store.session_snapshot(&session_id).await?;
+    let mut response = ApiSessionSummary::from(snapshot.summary);
+    response.projection = Some(ApiSessionProjection::from(&snapshot.projection));
     Ok(Json(response))
 }
 
@@ -1651,12 +2131,18 @@ async fn create_backup(
     get,
     path = "/api/v1/mcp/servers",
     tag = "configuration",
-    responses((status = 200, description = "MCP server diagnostics without environment values"))
+    responses((status = 200, body = [ApiMcpServerDiagnostics], description = "MCP server diagnostics without environment values"))
 )]
-async fn list_mcp_servers(
-    State(state): State<AppState>,
-) -> Json<Vec<piqo_tools::McpServerDiagnostics>> {
-    Json(state.mcp().diagnostics().await)
+async fn list_mcp_servers(State(state): State<AppState>) -> Json<Vec<ApiMcpServerDiagnostics>> {
+    Json(
+        state
+            .mcp()
+            .diagnostics()
+            .await
+            .into_iter()
+            .map(ApiMcpServerDiagnostics::from)
+            .collect(),
+    )
 }
 
 #[utoipa::path(
@@ -1878,9 +2364,8 @@ async fn get_agent_tree(
             .agent_links(&session_id)
             .await?
             .into_iter()
-            .map(serde_json::to_value)
-            .collect::<Result<_, _>>()
-            .map_err(StoreError::Json)?,
+            .map(ApiAgentTreeLink::from)
+            .collect(),
         session_id,
     }))
 }
@@ -1941,7 +2426,7 @@ async fn submit_tool_result(
     Ok(StatusCode::ACCEPTED)
 }
 
-#[utoipa::path(get, path = "/api/v1/sessions/{session_id}/runs/{run_id}/permission_requests", params(("session_id" = String, Path), ("run_id" = String, Path)), responses((status = 200)))]
+#[utoipa::path(get, path = "/api/v1/sessions/{session_id}/runs/{run_id}/permission_requests", params(("session_id" = String, Path), ("run_id" = String, Path)), responses((status = 200, body = PermissionRequestsResponse), (status = 404, body = ErrorResponse)))]
 async fn list_permission_requests(
     State(state): State<AppState>,
     ApiPath((session_id, run_id)): ApiPath<(String, String)>,
@@ -1962,7 +2447,10 @@ async fn list_permission_requests(
             agent_id: request.agent_id.clone(),
             tool_name: request.tool_name.clone(),
             arguments: request.arguments.clone(),
-            decision: request.decision,
+            decision: request
+                .decision
+                .map(permission_decision_name)
+                .map(str::to_owned),
         })
         .collect();
     Ok(Json(PermissionRequestsResponse { requests }))
@@ -2059,6 +2547,58 @@ fn session_phase_name(phase: SessionPhase) -> &'static str {
     }
 }
 
+fn agent_phase_name(phase: piqo_core::AgentPhase) -> &'static str {
+    match phase {
+        piqo_core::AgentPhase::Created => "created",
+        piqo_core::AgentPhase::Running => "running",
+        piqo_core::AgentPhase::WaitingForPermission => "waiting_for_permission",
+        piqo_core::AgentPhase::Finished => "finished",
+        piqo_core::AgentPhase::Failed => "failed",
+    }
+}
+
+fn message_role_name(role: piqo_core::MessageRole) -> &'static str {
+    match role {
+        piqo_core::MessageRole::System => "system",
+        piqo_core::MessageRole::User => "user",
+        piqo_core::MessageRole::Assistant => "assistant",
+        piqo_core::MessageRole::Tool => "tool",
+    }
+}
+
+fn permission_decision_name(decision: piqo_core::PermissionDecision) -> &'static str {
+    match decision {
+        piqo_core::PermissionDecision::Allow => "allow",
+        piqo_core::PermissionDecision::Ask => "ask",
+        piqo_core::PermissionDecision::Deny => "deny",
+    }
+}
+
+fn agent_terminal_status_name(status: piqo_core::AgentTerminalStatus) -> &'static str {
+    match status {
+        piqo_core::AgentTerminalStatus::Completed => "completed",
+        piqo_core::AgentTerminalStatus::Failed => "failed",
+        piqo_core::AgentTerminalStatus::Cancelled => "cancelled",
+        piqo_core::AgentTerminalStatus::Interrupted => "interrupted",
+    }
+}
+
+fn compaction_strategy_name(strategy: piqo_core::CompactionStrategy) -> &'static str {
+    match strategy {
+        piqo_core::CompactionStrategy::Deterministic => "deterministic",
+        piqo_core::CompactionStrategy::Llm => "llm",
+    }
+}
+
+fn mcp_server_state_name(state: piqo_tools::McpServerState) -> &'static str {
+    match state {
+        piqo_tools::McpServerState::Starting => "starting",
+        piqo_tools::McpServerState::Healthy => "healthy",
+        piqo_tools::McpServerState::Failed => "failed",
+        piqo_tools::McpServerState::Stopped => "stopped",
+    }
+}
+
 fn run_status_name(status: RunStatus) -> &'static str {
     match status {
         RunStatus::Queued => "queued",
@@ -2146,6 +2686,22 @@ fn event_for_sse(event: RecordedEvent) -> Event {
         CreateSessionRequest,
         UpdateSessionRetentionRequest,
         ApiSessionSummary,
+        ApiSessionProjection,
+        ApiSessionState,
+        ApiMessageProjection,
+        ApiMessageAuthor,
+        ApiContentBlock,
+        ApiToolCall,
+        ApiPermissionRequest,
+        ApiAgentBudget,
+        ApiAgentLink,
+        ApiDelegatedContextRef,
+        ApiAgentResult,
+        ApiAgentInstance,
+        ApiContextFact,
+        ApiToolCorrelation,
+        ApiContextArtifact,
+        ApiContextProjection,
         HistoryRetention,
         SessionListResponse,
         ForkSessionRequest,
@@ -2157,6 +2713,7 @@ fn event_for_sse(event: RecordedEvent) -> Event {
         RunAcceptedResponse,
         RunResponse,
         AgentTreeResponse,
+        ApiAgentTreeLink,
         ApiRun,
         ProviderCatalogResponse,
         AgentCatalogResponse,
@@ -2165,6 +2722,11 @@ fn event_for_sse(event: RecordedEvent) -> Event {
         PermissionSetting,
         ConfigReloadResponse,
         BackupResponse,
+        ApiMcpToolDefinition,
+        ApiMcpServerDiagnostics,
+        PermissionRequestResponse,
+        PermissionRequestsResponse,
+        SubmitToolResultRequest,
         ProviderCatalogEntry,
         CreateProviderRequest,
         UpdateProviderRequest,
@@ -2271,6 +2833,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         let response = app
+            .clone()
             .oneshot(
                 axum::http::Request::builder()
                     .uri("/api/v1/health")
@@ -2287,6 +2850,7 @@ mod tests {
     async fn creates_and_reads_a_session_over_http() {
         let (app, _state, _file) = app().await;
         let response = app
+            .clone()
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
@@ -2304,8 +2868,30 @@ mod tests {
             .await
             .expect("body reads")
             .to_bytes();
-        let session: ApiSessionSummary = serde_json::from_slice(&body).expect("response decodes");
-        assert_eq!(session.title.as_deref(), Some("demo"));
+        let session: Value = serde_json::from_slice(&body).expect("response decodes");
+        assert_eq!(session["title"], "demo");
+        let session_id = session["id"].as_str().expect("session id");
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/sessions/{session_id}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body reads")
+            .to_bytes();
+        let snapshot: Value = serde_json::from_slice(&body).expect("snapshot decodes");
+        assert_eq!(
+            snapshot["last_event_id"],
+            snapshot["projection"]["state"]["last_event_id"]
+        );
+        assert!(snapshot["projection"]["runs"].is_object());
     }
 
     #[tokio::test]
@@ -2330,6 +2916,8 @@ mod tests {
         let document: Value = serde_json::from_slice(&body).expect("openapi decodes");
         assert!(document["paths"]["/api/v1/sessions"].is_object());
         assert!(document["components"]["securitySchemes"]["bearerAuth"].is_object());
+        assert!(document["components"]["schemas"]["ApiSessionProjection"].is_object());
+        assert!(document["components"]["schemas"]["ApiMcpServerDiagnostics"].is_object());
         assert_eq!(document["security"][0]["bearerAuth"], serde_json::json!([]));
     }
 

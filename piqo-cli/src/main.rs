@@ -72,6 +72,16 @@ enum Command {
         #[command(subcommand)]
         command: StorageCommand,
     },
+    /// Inspect a run or submit a client-managed tool result through the public API.
+    Action {
+        #[command(subcommand)]
+        command: ActionCommand,
+    },
+    /// Inspect and resolve durable permission requests through the public API.
+    Permission {
+        #[command(subcommand)]
+        command: PermissionCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -134,6 +144,66 @@ enum ProjectCommand {
 enum StorageCommand {
     /// Create a consistent SQLite backup through the running server.
     Backup {
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        server: String,
+        #[arg(long, env = "PIQO_SERVER_TOKEN")]
+        token: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ActionCommand {
+    /// Print the structured run projection.
+    Inspect {
+        session_id: String,
+        run_id: String,
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        server: String,
+        #[arg(long, env = "PIQO_SERVER_TOKEN")]
+        token: Option<String>,
+    },
+    /// Submit arbitrary JSON for a client-managed provider tool call.
+    Result {
+        session_id: String,
+        run_id: String,
+        call_id: String,
+        /// JSON value passed as the tool result.
+        result: String,
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        server: String,
+        #[arg(long, env = "PIQO_SERVER_TOKEN")]
+        token: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PermissionCommand {
+    /// List pending permission requests for a run.
+    List {
+        session_id: String,
+        run_id: String,
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        server: String,
+        #[arg(long, env = "PIQO_SERVER_TOKEN")]
+        token: Option<String>,
+    },
+    /// Approve a pending permission request.
+    Approve {
+        session_id: String,
+        run_id: String,
+        request_id: String,
+        #[arg(long, value_parser = ["once", "session", "project", "configuration"])]
+        scope: String,
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        server: String,
+        #[arg(long, env = "PIQO_SERVER_TOKEN")]
+        token: Option<String>,
+    },
+    /// Deny a pending permission request.
+    Deny {
+        session_id: String,
+        run_id: String,
+        request_id: String,
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         server: String,
         #[arg(long, env = "PIQO_SERVER_TOKEN")]
@@ -218,6 +288,8 @@ async fn main() -> Result<()> {
             let response = response.error_for_status()?;
             println!("{}", response.text().await?);
         }
+        Command::Action { command } => run_action_command(command).await?,
+        Command::Permission { command } => run_permission_command(command).await?,
         Command::Run {
             prompt,
             server,
@@ -371,6 +443,112 @@ async fn run_project_command(command: ProjectCommand) -> Result<()> {
             }
             authenticated(
                 client.delete(format!("{server}/api/v1/projects/{project_id}")),
+                token,
+            )
+            .send()
+            .await?
+            .error_for_status()?;
+            Ok(())
+        }
+    }
+}
+
+async fn run_action_command(command: ActionCommand) -> Result<()> {
+    let client = Client::new();
+    match command {
+        ActionCommand::Inspect {
+            session_id,
+            run_id,
+            server,
+            token,
+        } => {
+            let response = authenticated(
+                client.get(format!(
+                    "{server}/api/v1/sessions/{session_id}/runs/{run_id}"
+                )),
+                token,
+            )
+            .send()
+            .await?
+            .error_for_status()?;
+            print_json(response).await
+        }
+        ActionCommand::Result {
+            session_id,
+            run_id,
+            call_id,
+            result,
+            server,
+            token,
+        } => {
+            let result: Value =
+                serde_json::from_str(&result).context("--result must be a valid JSON value")?;
+            authenticated(
+                client.post(format!(
+                    "{server}/api/v1/sessions/{session_id}/runs/{run_id}/tool_calls/{call_id}/result"
+                )),
+                token,
+            )
+            .json(&json!({"result": result}))
+            .send()
+            .await?
+            .error_for_status()?;
+            Ok(())
+        }
+    }
+}
+
+async fn run_permission_command(command: PermissionCommand) -> Result<()> {
+    let client = Client::new();
+    match command {
+        PermissionCommand::List {
+            session_id,
+            run_id,
+            server,
+            token,
+        } => {
+            let response = authenticated(
+                client.get(format!(
+                    "{server}/api/v1/sessions/{session_id}/runs/{run_id}/permission_requests"
+                )),
+                token,
+            )
+            .send()
+            .await?
+            .error_for_status()?;
+            print_json(response).await
+        }
+        PermissionCommand::Approve {
+            session_id,
+            run_id,
+            request_id,
+            scope,
+            server,
+            token,
+        } => {
+            authenticated(
+                client.post(format!(
+                    "{server}/api/v1/sessions/{session_id}/runs/{run_id}/permission_requests/{request_id}/approve"
+                )),
+                token,
+            )
+            .json(&json!({"scope": scope}))
+            .send()
+            .await?
+            .error_for_status()?;
+            Ok(())
+        }
+        PermissionCommand::Deny {
+            session_id,
+            run_id,
+            request_id,
+            server,
+            token,
+        } => {
+            authenticated(
+                client.post(format!(
+                    "{server}/api/v1/sessions/{session_id}/runs/{run_id}/permission_requests/{request_id}/deny"
+                )),
                 token,
             )
             .send()
