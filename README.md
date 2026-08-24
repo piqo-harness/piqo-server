@@ -32,7 +32,7 @@ Available today:
 Designed or partially implemented, but **not wired into the server yet**:
 
 - plugin protocols beyond MCP stdio;
-- orchestrator/subagent execution;
+- distributed orchestrator/subagent execution beyond the local linked-session delegation path;
 - TLS termination and remote access;
 - a TUI, desktop UI, or other interactive client.
 
@@ -457,6 +457,29 @@ The merge is deliberately **shallow**. If two layers define the same key, the
 entire later value replaces the earlier one. Unknown keys such as `top_k` or
 `chat_template_kwargs` remain untouched.
 
+### Delegated agents
+
+A named agent may delegate with Piqo's managed `delegate` tool when it sets
+`permissions.tools.delegate` to `allow` or `ask`. The model supplies a named
+child profile, a task, and explicit parent `context_message_ids`; Piqo creates
+a linked child session and returns a bounded structured result to the parent.
+Use `GET /api/v1/sessions/{id}/agent-tree` to inspect links, and subscribe to
+each child session's SSE stream separately.
+
+```toml
+[orchestration]
+max_depth = 1
+max_concurrent_per_tree = 2
+max_concurrent_global = 4
+max_child_model_turns = 32
+max_child_duration_seconds = 600
+max_tree_duration_seconds = 1800
+max_tree_tokens = 262144
+max_context_bytes = 65536
+max_context_message_ids = 32
+max_result_bytes = 65536
+```
+
 ### Context compaction
 
 Piqo estimates automatic transcripts with the deterministic `utf8_bytes_v1`
@@ -591,6 +614,7 @@ curl -N \
 | `GET` | `/api/v1/sessions/{id}/events` | Paginated event history |
 | `GET` | `/api/v1/sessions/{id}/events/stream` | Replayable SSE stream |
 | `POST` | `/api/v1/sessions/{id}/forks` | Fork at an event ID |
+| `GET` | `/api/v1/sessions/{id}/agent-tree` | Linked delegated-agent topology |
 | `GET`, `POST` | `/api/v1/providers` | List or create providers |
 | `GET` | `/api/v1/agents` | List resolved user-defined agents without their prompts |
 | `GET`, `PATCH`, `DELETE` | `/api/v1/providers/{provider}` | Inspect, update, or immediately delete a provider |

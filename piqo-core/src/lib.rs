@@ -2,6 +2,7 @@
 
 mod context;
 mod event_log;
+mod orchestration;
 mod permissions;
 mod session;
 
@@ -10,6 +11,9 @@ pub use context::{
     ToolCorrelation, CONTEXT_ESTIMATOR_VERSION,
 };
 pub use event_log::{EventId, EventLog, EventLogError, RecordedEvent, SemanticEvent};
+pub use orchestration::{
+    AgentBudget, AgentLink, AgentResult, AgentTerminalStatus, DelegatedContextRef,
+};
 pub use permissions::{
     PermissionDecision, PermissionDecisionSource, PermissionEvaluation, PermissionPolicy,
     PermissionRule, PermissionScope, ToolRequest,

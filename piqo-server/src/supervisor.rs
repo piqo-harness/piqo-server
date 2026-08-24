@@ -1,15 +1,16 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
 
 use futures_util::StreamExt;
 use piqo_core::{
-    estimate_tokens, CompactionStrategy, ContentBlock, ContextArtifact, MessageRole,
-    PermissionDecision, PermissionDecisionSource, PermissionScope, RecordedEvent, RunProjection,
-    RunStatus, SemanticEvent, SessionPhase, ToolCorrelation, CONTEXT_ESTIMATOR_VERSION,
+    estimate_tokens, AgentBudget, AgentLink, AgentResult, AgentTerminalStatus, CompactionStrategy,
+    ContentBlock, ContextArtifact, DelegatedContextRef, MessageRole, PermissionDecision,
+    PermissionDecisionSource, PermissionScope, RecordedEvent, RunProjection, RunStatus,
+    SemanticEvent, SessionPhase, ToolCorrelation, CONTEXT_ESTIMATOR_VERSION,
 };
 use piqo_provider::{
     merge_request_bodies, parse_non_stream_response, ProviderDelta, ProviderProtocol,
@@ -26,7 +27,7 @@ use uuid::Uuid;
 
 use crate::{
     config::{ConfigManager, PermissionSetting, PiqoConfig, ResolvedProvider},
-    storage::StoreError,
+    storage::{AgentLinkRecord, StoreError},
     SqliteStore,
 };
 
@@ -104,7 +105,7 @@ pub struct SessionSupervisor {
     deleting_projects: Arc<Mutex<HashSet<String>>>,
     dump_dir: Option<PathBuf>,
     shutdown: CancellationToken,
-    workers: Arc<Mutex<JoinSet<()>>>,
+    workers: Arc<StdMutex<JoinSet<()>>>,
 }
 
 impl SessionSupervisor {
@@ -144,14 +145,17 @@ impl SessionSupervisor {
             deleting_projects: Arc::new(Mutex::new(HashSet::new())),
             dump_dir,
             shutdown,
-            workers: Arc::new(Mutex::new(JoinSet::new())),
+            workers: Arc::new(StdMutex::new(JoinSet::new())),
         }
     }
 
     pub async fn shutdown(&self, grace: Duration) -> Result<(), StoreError> {
         self.shutdown.cancel();
         let mut workers = {
-            let mut tracked = self.workers.lock().await;
+            let mut tracked = self
+                .workers
+                .lock()
+                .map_err(|_| StoreError::WorkerStatePoisoned)?;
             std::mem::take(&mut *tracked)
         };
         let workers_finished = timeout(grace, async {
@@ -207,7 +211,7 @@ impl SessionSupervisor {
                 continue;
             }
             if projection.ready_action_run().is_some() {
-                self.spawn_worker(session_id).await;
+                self.spawn_worker(session_id);
             }
         }
         Ok(())
@@ -284,7 +288,7 @@ impl SessionSupervisor {
             },
         )
         .await?;
-        self.spawn_worker(session_id.to_owned()).await;
+        self.spawn_worker(session_id.to_owned());
         Ok(run_id)
     }
 
@@ -298,7 +302,7 @@ impl SessionSupervisor {
             return Err(StoreError::QueueNotPaused);
         }
         self.append(session_id, SemanticEvent::QueueResumed).await?;
-        self.spawn_worker(session_id.to_owned()).await;
+        self.spawn_worker(session_id.to_owned());
         Ok(())
     }
 
@@ -400,7 +404,7 @@ impl SessionSupervisor {
         drop(guard);
         self.release_session_lock(session_id, &lock).await;
         if matches!(outcome, Ok(true)) {
-            self.spawn_worker(session_id.to_owned()).await;
+            self.spawn_worker(session_id.to_owned());
         }
         outcome.map(|_| ())
     }
@@ -535,14 +539,14 @@ impl SessionSupervisor {
                 .execute_approved_native_calls(session_id, run_id)
                 .await?
             {
-                self.spawn_worker(session_id.to_owned()).await;
+                self.spawn_worker(session_id.to_owned());
             }
         } else if decision == PermissionDecision::Deny
             && self
                 .resume_if_tool_results_ready(session_id, run_id)
                 .await?
         {
-            self.spawn_worker(session_id.to_owned()).await;
+            self.spawn_worker(session_id.to_owned());
         }
         Ok(())
     }
@@ -567,6 +571,19 @@ impl SessionSupervisor {
                     },
                 )
                 .await?;
+                for child in self
+                    .store
+                    .agent_links(session_id)
+                    .await?
+                    .into_iter()
+                    .filter(|link| {
+                        link.parent_session_id == session_id && link.parent_run_id == run_id
+                    })
+                {
+                    let _ =
+                        Box::pin(self.cancel(&child.child_session_id, &child.child_run_id)).await;
+                }
+                self.deliver_child_result(session_id, run_id).await?;
                 Ok(())
             }
             RunStatus::Running => {
@@ -616,7 +633,7 @@ impl SessionSupervisor {
             events.push(SemanticEvent::QueueResumed);
         }
         self.append_many(session_id, events).await?;
-        self.spawn_worker(session_id.to_owned()).await;
+        self.spawn_worker(session_id.to_owned());
         Ok(new_id)
     }
 
@@ -700,17 +717,20 @@ impl SessionSupervisor {
         self.release_session_lock(session_id, &lock).await;
     }
 
-    async fn spawn_worker(&self, session_id: String) {
+    fn spawn_worker(&self, session_id: String) {
         if self.shutdown.is_cancelled() {
             return;
         }
         let this = self.clone();
-        let mut workers = self.workers.lock().await;
-        if self.shutdown.is_cancelled() {
-            return;
-        }
+        let mut workers = match self.workers.lock() {
+            Ok(workers) => workers,
+            Err(_) => {
+                tracing::error!(%session_id, "worker tracking state is poisoned");
+                return;
+            }
+        };
         workers.spawn(async move {
-            if let Err(error) = this.process_session(&session_id).await {
+            if let Err(error) = Box::pin(this.process_session(&session_id)).await {
                 tracing::error!(%session_id, %error, "session worker stopped");
             }
         });
@@ -735,12 +755,7 @@ impl SessionSupervisor {
                     return Ok(());
                 }
                 if let Some(run) = projection.ready_action_run().cloned() {
-                    let max_turns = self
-                        .config
-                        .snapshot()
-                        .map_err(|error| StoreError::ProviderUnavailable(error.to_string()))?
-                        .defaults
-                        .max_model_turns;
+                    let max_turns = self.max_model_turns(session_id).await?;
                     if run.attempts >= max_turns {
                         self.append(
                             session_id,
@@ -768,7 +783,7 @@ impl SessionSupervisor {
                         .await
                         .insert(run.run_id.clone(), token.clone());
                     let result = self
-                        .execute_run(session_id, &run, token, None, None, 0)
+                        .execute_run_with_child_timeout(session_id, &run, token, None, None, 0)
                         .await;
                     self.cancellations.lock().await.remove(&run.run_id);
                     self.finish_run(session_id, &run, result).await?;
@@ -825,7 +840,7 @@ impl SessionSupervisor {
                 run.attempt_id = Some(attempt_id);
                 run.attempts += 1;
                 let result = self
-                    .execute_run(session_id, &run, token, None, None, 0)
+                    .execute_run_with_child_timeout(session_id, &run, token, None, None, 0)
                     .await;
                 self.cancellations.lock().await.remove(&run.run_id);
                 self.finish_run(session_id, &run, result).await?;
@@ -845,6 +860,74 @@ impl SessionSupervisor {
                 .is_some_and(|current| Arc::ptr_eq(current, lock))
         {
             locks.remove(session_id);
+        }
+    }
+
+    async fn child_budget(&self, session_id: &str) -> Result<Option<AgentBudget>, StoreError> {
+        Ok(self
+            .store
+            .agent_links(session_id)
+            .await?
+            .into_iter()
+            .find(|link| link.child_session_id == session_id)
+            .map(|link| link.budget))
+    }
+
+    async fn max_model_turns(&self, session_id: &str) -> Result<u32, StoreError> {
+        if let Some(budget) = self.child_budget(session_id).await? {
+            return Ok(budget.max_model_turns);
+        }
+        Ok(self
+            .config
+            .snapshot()
+            .map_err(|error| StoreError::ProviderUnavailable(error.to_string()))?
+            .defaults
+            .max_model_turns)
+    }
+
+    async fn execute_run_with_child_timeout(
+        &self,
+        session_id: &str,
+        run: &RunProjection,
+        cancellation: CancellationToken,
+        execution: Option<Arc<RunExecutionConfig>>,
+        existing_assistant_message: Option<String>,
+        retry_count: u8,
+    ) -> ExecutionResult {
+        let Some(budget) = (match self.child_budget(session_id).await {
+            Ok(budget) => budget,
+            Err(error) => return ExecutionResult::Failed(error.to_string(), false),
+        }) else {
+            return self
+                .execute_run(
+                    session_id,
+                    run,
+                    cancellation,
+                    execution,
+                    existing_assistant_message,
+                    retry_count,
+                )
+                .await;
+        };
+        let timeout_cancellation = cancellation.clone();
+        match timeout(
+            Duration::from_secs(budget.max_duration_seconds),
+            Box::pin(self.execute_run(
+                session_id,
+                run,
+                cancellation,
+                execution,
+                existing_assistant_message,
+                retry_count,
+            )),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                timeout_cancellation.cancel();
+                ExecutionResult::Failed("child_timeout".to_owned(), false)
+            }
         }
     }
 
@@ -950,11 +1033,14 @@ impl SessionSupervisor {
                     Ok(_) => Vec::new(),
                     Err(error) => return ExecutionResult::Failed(error.to_string(), false),
                 };
-                let mcp_tools = if request.body.get("tools").is_some() {
+                let mut mcp_tools = if request.body.get("tools").is_some() {
                     Vec::new()
                 } else {
                     configured_mcp_tools(&config, &request, self.mcp.catalog().await)
                 };
+                if configured_delegate(&config, &request) && request.body.get("tools").is_none() {
+                    mcp_tools.push(delegate_tool_definition());
+                }
                 let body = match self
                     .build_compacted_body(
                         session_id,
@@ -1782,6 +1868,15 @@ impl SessionSupervisor {
             serde_json::from_value(run.request.clone()).map_err(StoreError::Json)?;
         let agent_id = request.agent.unwrap_or_else(|| "assistant".to_owned());
         let configured = self.config.agent(&agent_id).ok();
+        let parent_ceiling = self
+            .store
+            .agent_links(session_id)
+            .await?
+            .into_iter()
+            .find(|link| link.child_session_id == session_id)
+            .map(|link| serde_json::from_value::<crate::AgentPermissions>(link.permission_ceiling))
+            .transpose()
+            .map_err(StoreError::Json)?;
         let session = self.store.get_session(session_id).await?;
         let projection = self.store.projection(session_id).await?;
         let run = projection
@@ -1792,29 +1887,22 @@ impl SessionSupervisor {
         let mut has_pending_approval = false;
         for call in run.tool_calls.values().filter(|call| call.result.is_none()) {
             let request_id = Uuid::now_v7().to_string();
-            let configured_decision =
-                configured
-                    .as_ref()
-                    .and_then(|agent| match call.tool_name.as_str() {
-                        "read" => agent.permissions.read,
-                        "write" | "edit" => agent.permissions.write,
-                        "bash" => agent.permissions.bash,
-                        _ => agent
-                            .permissions
-                            .tools
-                            .get(&call.tool_name)
-                            .copied()
-                            .or(agent.permissions.mcp),
-                    });
-            let (decision, source, rule_id) =
-                if configured_decision == Some(PermissionSetting::Deny) {
-                    (
-                        PermissionDecision::Deny,
-                        PermissionDecisionSource::Configuration,
-                        None,
-                    )
-                } else if let Some(rule) = self
-                    .store
+            let configured_decision = configured
+                .as_ref()
+                .and_then(|agent| permission_setting(&agent.permissions, &call.tool_name));
+            let parent_decision = parent_ceiling
+                .as_ref()
+                .and_then(|permissions| permission_setting(permissions, &call.tool_name));
+            let configured_decision = parent_decision.map_or(configured_decision, |parent| {
+                Some(most_restrictive_permission(
+                    configured_decision.unwrap_or(PermissionSetting::Deny),
+                    parent,
+                ))
+            });
+            let parent_allows_interactive =
+                parent_decision.is_none_or(|decision| decision == PermissionSetting::Allow);
+            let matching_rule = if parent_allows_interactive {
+                self.store
                     .matching_permission_rule(
                         session_id,
                         session.project_id.as_deref(),
@@ -1824,7 +1912,17 @@ impl SessionSupervisor {
                             .unwrap_or(&call.tool_name),
                     )
                     .await?
-                {
+            } else {
+                None
+            };
+            let (decision, source, rule_id) =
+                if configured_decision == Some(PermissionSetting::Deny) {
+                    (
+                        PermissionDecision::Deny,
+                        PermissionDecisionSource::Configuration,
+                        None,
+                    )
+                } else if let Some(rule) = matching_rule {
                     let source = match rule.scope {
                         PermissionScope::Session => PermissionDecisionSource::SessionRule,
                         PermissionScope::Project => PermissionDecisionSource::ProjectRule,
@@ -1892,6 +1990,20 @@ impl SessionSupervisor {
         run_id: &str,
         tool_name: &str,
     ) -> Result<bool, StoreError> {
+        if tool_name == "delegate" {
+            let projection = self.store.projection(session_id).await?;
+            let run = projection
+                .runs
+                .get(run_id)
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_owned()))?;
+            let request: RunRequest =
+                serde_json::from_value(run.request.clone()).map_err(StoreError::Json)?;
+            let config = self
+                .config
+                .snapshot()
+                .map_err(|error| StoreError::ProviderUnavailable(error.to_string()))?;
+            return Ok(configured_delegate(&config, &request));
+        }
         let tool = NativeTool::parse(tool_name);
         let session = self.store.get_session(session_id).await?;
         if session.project_id.is_none() && tool.is_some() {
@@ -1985,6 +2097,28 @@ impl SessionSupervisor {
                 .get(run_id)
                 .cloned()
                 .unwrap_or_else(CancellationToken::new);
+            if tool_name == "delegate" {
+                match self
+                    .spawn_delegated_child(session_id, run_id, &call_id, &agent_id, &arguments)
+                    .await
+                {
+                    Ok(()) => continue,
+                    Err(error) => {
+                        self.append(
+                            session_id,
+                            SemanticEvent::ToolResult {
+                                run_id: run_id.to_owned(),
+                                call_id,
+                                agent_id,
+                                tool_name,
+                                result: json!({"error":{"code":"delegate_rejected","message":error.to_string()}}),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                }
+            }
             let result = if let Some(tool) = tool {
                 let project = project.as_ref().ok_or_else(|| {
                     StoreError::InvalidRequest(
@@ -2048,6 +2182,225 @@ impl SessionSupervisor {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    async fn spawn_delegated_child(
+        &self,
+        parent_session_id: &str,
+        parent_run_id: &str,
+        parent_call_id: &str,
+        parent_agent_id: &str,
+        arguments: &Value,
+    ) -> Result<(), StoreError> {
+        let request: DelegationRequest =
+            serde_json::from_value(arguments.clone()).map_err(|_| {
+                StoreError::InvalidRequest(
+                    "delegate requires agent, task, and context_message_ids".to_owned(),
+                )
+            })?;
+        let config = self
+            .config
+            .snapshot()
+            .map_err(|error| StoreError::ProviderUnavailable(error.to_string()))?;
+        let child = config
+            .agent(&request.agent)
+            .map_err(|error| StoreError::InvalidRequest(error.to_string()))?;
+        let provider = child.provider.clone().ok_or_else(|| {
+            StoreError::InvalidRequest("delegated agent must configure a provider".to_owned())
+        })?;
+        let model = child.model.clone().ok_or_else(|| {
+            StoreError::InvalidRequest("delegated agent must configure a model".to_owned())
+        })?;
+        self.config
+            .resolve_provider(&provider)
+            .map_err(|error| match error {
+                crate::config::ConfigError::ProviderNotFound(name) => {
+                    StoreError::ProviderNotFound(name)
+                }
+                other => StoreError::ProviderUnavailable(other.to_string()),
+            })?;
+        let limits = &config.orchestration;
+        let parent_depth = self
+            .store
+            .agent_links(parent_session_id)
+            .await?
+            .into_iter()
+            .find(|link| link.child_session_id == parent_session_id)
+            .map_or(0, |link| link.depth);
+        if parent_depth >= limits.max_depth {
+            return Err(StoreError::InvalidRequest(
+                "delegated agent depth limit exceeded".to_owned(),
+            ));
+        }
+        if request.context_message_ids.len() > limits.max_context_message_ids {
+            return Err(StoreError::InvalidRequest(
+                "delegated context has too many messages".to_owned(),
+            ));
+        }
+        let parent_projection = self.store.projection(parent_session_id).await?;
+        let parent_run = parent_projection
+            .runs
+            .get(parent_run_id)
+            .ok_or_else(|| StoreError::RunNotFound(parent_run_id.to_owned()))?;
+        let parent_request: RunRequest =
+            serde_json::from_value(parent_run.request.clone()).map_err(StoreError::Json)?;
+        let parent_permissions = parent_request
+            .agent
+            .as_deref()
+            .and_then(|agent| config.agent(agent).ok())
+            .map(|agent| agent.permissions)
+            .unwrap_or_default();
+        let permission_ceiling =
+            serde_json::to_value(parent_permissions).map_err(StoreError::Json)?;
+        let mut copied = Vec::new();
+        let mut references = Vec::new();
+        for message_id in &request.context_message_ids {
+            let message = parent_projection
+                .messages
+                .iter()
+                .find(|message| message.message_id == *message_id)
+                .filter(|message| message.completed || message.interrupted)
+                .ok_or_else(|| {
+                    StoreError::InvalidRequest(
+                        "delegated context message is unknown or open".to_owned(),
+                    )
+                })?;
+            references.push(DelegatedContextRef {
+                source_session_id: parent_session_id.to_owned(),
+                message_id: message.message_id.clone(),
+                last_event_id: message.last_event_id,
+            });
+            copied.push(json!({"message_id": message.message_id, "role": role_name(message.role), "blocks": message.blocks}));
+        }
+        let copied_value = Value::Array(copied);
+        if serde_json::to_vec(&copied_value)
+            .map_err(StoreError::Json)?
+            .len()
+            > limits.max_context_bytes
+        {
+            return Err(StoreError::InvalidRequest(
+                "delegated context exceeds the byte limit".to_owned(),
+            ));
+        }
+        let parent_session = self.store.get_session(parent_session_id).await?;
+        let child_session = self
+            .store
+            .create_session(
+                Some(format!("Delegated: {}", request.agent)),
+                parent_session.project_id,
+            )
+            .await?;
+        let instance_id = Uuid::now_v7().to_string();
+        let child_run_id = Uuid::now_v7().to_string();
+        let budget = AgentBudget {
+            max_model_turns: limits.max_child_model_turns,
+            max_duration_seconds: limits.max_child_duration_seconds,
+            max_tree_duration_seconds: limits.max_tree_duration_seconds,
+            max_tree_tokens: limits.max_tree_tokens,
+            max_context_bytes: u64::try_from(limits.max_context_bytes).unwrap_or(u64::MAX),
+            max_result_bytes: u64::try_from(limits.max_result_bytes).unwrap_or(u64::MAX),
+        };
+        let link = AgentLink {
+            instance_id: instance_id.clone(),
+            profile_id: request.agent.clone(),
+            parent_session_id: parent_session_id.to_owned(),
+            parent_run_id: parent_run_id.to_owned(),
+            parent_call_id: parent_call_id.to_owned(),
+            child_session_id: child_session.id.clone(),
+            child_run_id: child_run_id.clone(),
+            depth: parent_depth.saturating_add(1),
+            budget: budget.clone(),
+            permission_ceiling: permission_ceiling.clone(),
+        };
+        let record = AgentLinkRecord {
+            instance_id: link.instance_id.clone(),
+            profile_id: link.profile_id.clone(),
+            parent_session_id: link.parent_session_id.clone(),
+            parent_run_id: link.parent_run_id.clone(),
+            parent_call_id: link.parent_call_id.clone(),
+            child_session_id: link.child_session_id.clone(),
+            child_run_id: link.child_run_id.clone(),
+            depth: link.depth,
+            budget,
+            permission_ceiling,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        self.store.create_agent_link(&record).await?;
+        self.append(
+            parent_session_id,
+            SemanticEvent::AgentSpawned {
+                agent_id: instance_id.clone(),
+                parent_id: Some(parent_agent_id.to_owned()),
+                link: Some(link.clone()),
+                config_revision: None,
+            },
+        )
+        .await?;
+        self.append_many(
+            &child_session.id,
+            vec![
+                SemanticEvent::AgentSpawned {
+                    agent_id: instance_id.clone(),
+                    parent_id: Some(parent_agent_id.to_owned()),
+                    link: Some(link),
+                    config_revision: None,
+                },
+                SemanticEvent::AgentContextCaptured {
+                    agent_id: instance_id.clone(),
+                    references,
+                },
+                SemanticEvent::MessageStarted {
+                    message_id: Uuid::now_v7().to_string(),
+                    agent_id: parent_agent_id.to_owned(),
+                    role: MessageRole::System,
+                    author: piqo_core::MessageAuthor::Agent(parent_agent_id.to_owned()),
+                },
+            ],
+        )
+        .await?;
+        let context_message = self
+            .store
+            .projection(&child_session.id)
+            .await?
+            .messages
+            .last()
+            .map(|message| message.message_id.clone())
+            .ok_or_else(|| StoreError::CorruptSession {
+                session_id: child_session.id.clone(),
+                reason: "delegated context message was not projected".to_owned(),
+            })?;
+        self.append_many(
+            &child_session.id,
+            vec![
+                SemanticEvent::MessageContentAppended {
+                    message_id: context_message.clone(),
+                    block: ContentBlock::Json(
+                        json!({"delegated_from": parent_session_id, "messages": copied_value}),
+                    ),
+                },
+                SemanticEvent::MessageCompleted {
+                    message_id: context_message,
+                },
+                SemanticEvent::RunQueued {
+                    run_id: child_run_id,
+                    retry_of: None,
+                    provider,
+                    model,
+                    request: serde_json::to_value(RunRequest {
+                        provider: child.provider.unwrap_or_default(),
+                        model: child.model.unwrap_or_default(),
+                        input: Value::String(request.task),
+                        agent: Some(request.agent),
+                        variant: None,
+                        body: Value::Object(Default::default()),
+                    })
+                    .map_err(StoreError::Json)?,
+                },
+            ],
+        )
+        .await?;
+        self.spawn_worker(child_session.id);
+        Ok(())
     }
 
     async fn finish_run(
@@ -2208,6 +2561,133 @@ impl SessionSupervisor {
             }
             ExecutionResult::Completed => {}
         }
+        self.deliver_child_result(session_id, &run.run_id).await?;
+        Ok(())
+    }
+
+    async fn deliver_child_result(
+        &self,
+        child_session_id: &str,
+        child_run_id: &str,
+    ) -> Result<(), StoreError> {
+        let Some(link) = self
+            .store
+            .agent_links(child_session_id)
+            .await?
+            .into_iter()
+            .find(|link| {
+                link.child_session_id == child_session_id && link.child_run_id == child_run_id
+            })
+        else {
+            return Ok(());
+        };
+        let child = self.store.projection(child_session_id).await?;
+        let run = child
+            .runs
+            .get(child_run_id)
+            .ok_or_else(|| StoreError::RunNotFound(child_run_id.to_owned()))?;
+        let status = match run.status {
+            RunStatus::Completed => AgentTerminalStatus::Completed,
+            RunStatus::Failed => AgentTerminalStatus::Failed,
+            RunStatus::Cancelled => AgentTerminalStatus::Cancelled,
+            RunStatus::Interrupted => AgentTerminalStatus::Interrupted,
+            _ => return Ok(()),
+        };
+        let max = usize::try_from(link.budget.max_result_bytes).unwrap_or(usize::MAX);
+        let text = child
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::Assistant)
+            .map(|message| {
+                message
+                    .blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text(text) => Some(text.as_str()),
+                        ContentBlock::Json(_) => None,
+                    })
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        let (output, output_truncated) = truncate_utf8(text, max);
+        let result = AgentResult {
+            instance_id: link.instance_id.clone(),
+            profile_id: link.profile_id.clone(),
+            child_session_id: child_session_id.to_owned(),
+            child_run_id: child_run_id.to_owned(),
+            status,
+            output: (status == AgentTerminalStatus::Completed).then_some(Value::String(output)),
+            output_truncated,
+            usage: None,
+            error: (status != AgentTerminalStatus::Completed).then(|| {
+                match status {
+                    AgentTerminalStatus::Failed => "child_failed",
+                    AgentTerminalStatus::Cancelled => "child_cancelled",
+                    AgentTerminalStatus::Interrupted => "child_interrupted",
+                    AgentTerminalStatus::Completed => "",
+                }
+                .to_owned()
+            }),
+        };
+        if child
+            .agent_instances
+            .get(&link.instance_id)
+            .and_then(|instance| instance.result.as_ref())
+            .is_none()
+        {
+            self.append(
+                child_session_id,
+                SemanticEvent::AgentFinished {
+                    agent_id: link.instance_id.clone(),
+                    result: Some(result.clone()),
+                },
+            )
+            .await?;
+        }
+        let parent = self.store.projection(&link.parent_session_id).await?;
+        if parent
+            .agent_instances
+            .get(&link.instance_id)
+            .and_then(|instance| instance.result.as_ref())
+            .is_some()
+        {
+            return Ok(());
+        }
+        let parent_run = parent
+            .runs
+            .get(&link.parent_run_id)
+            .ok_or_else(|| StoreError::RunNotFound(link.parent_run_id.clone()))?;
+        let all_ready = parent_run
+            .tool_calls
+            .values()
+            .all(|call| call.call_id == link.parent_call_id || call.result.is_some());
+        let mut events = vec![
+            SemanticEvent::AgentFinished {
+                agent_id: link.instance_id.clone(),
+                result: Some(result.clone()),
+            },
+            SemanticEvent::AgentResultDelivered {
+                agent_id: link.instance_id.clone(),
+                parent_run_id: link.parent_run_id.clone(),
+                parent_call_id: link.parent_call_id.clone(),
+                result: result.clone(),
+            },
+            SemanticEvent::ToolResult {
+                run_id: link.parent_run_id.clone(),
+                call_id: link.parent_call_id.clone(),
+                agent_id: "delegate".to_owned(),
+                tool_name: "delegate".to_owned(),
+                result: serde_json::to_value(&result).map_err(StoreError::Json)?,
+            },
+        ];
+        if all_ready {
+            events.push(SemanticEvent::QueueResumed);
+        }
+        self.append_many(&link.parent_session_id, events).await?;
+        if all_ready {
+            Box::pin(self.process_session(&link.parent_session_id)).await?;
+        }
         Ok(())
     }
 
@@ -2311,6 +2791,14 @@ struct ToolCallBuffer {
     arguments: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DelegationRequest {
+    agent: String,
+    task: String,
+    context_message_ids: Vec<String>,
+}
+
 enum DeltaResult {
     None,
     Usage(Value),
@@ -2332,6 +2820,17 @@ fn body_token_estimate(body: &Value) -> u64 {
         transcript_items,
         tool_definitions,
     )
+}
+
+fn truncate_utf8(value: String, max_bytes: usize) -> (String, bool) {
+    if value.len() <= max_bytes {
+        return (value, false);
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    (value[..end].to_owned(), true)
 }
 
 fn deterministic_summary(messages: &[&piqo_core::MessageProjection]) -> String {
@@ -2543,6 +3042,69 @@ fn configured_mcp_tools(
             )
         })
         .collect()
+}
+
+fn configured_delegate(config: &PiqoConfig, request: &RunRequest) -> bool {
+    let Some(agent_name) = request.agent.as_deref() else {
+        return false;
+    };
+    let Ok(agent) = config.agent(agent_name) else {
+        return false;
+    };
+    matches!(
+        agent.permissions.tools.get("delegate"),
+        Some(PermissionSetting::Allow | PermissionSetting::Ask)
+    )
+}
+
+fn permission_setting(
+    permissions: &crate::AgentPermissions,
+    tool_name: &str,
+) -> Option<PermissionSetting> {
+    match tool_name {
+        "read" => permissions.read,
+        "write" | "edit" => permissions.write,
+        "bash" => permissions.bash,
+        _ => permissions
+            .tools
+            .get(tool_name)
+            .copied()
+            .or(permissions.mcp),
+    }
+}
+
+fn most_restrictive_permission(
+    left: PermissionSetting,
+    right: PermissionSetting,
+) -> PermissionSetting {
+    use PermissionSetting::{Allow, Ask, Deny};
+    match (left, right) {
+        (Deny, _) | (_, Deny) => Deny,
+        (Ask, _) | (_, Ask) => Ask,
+        (Allow, Allow) => Allow,
+    }
+}
+
+fn delegate_tool_definition() -> McpToolDefinition {
+    McpToolDefinition {
+        name: "delegate".to_owned(),
+        server_id: "piqo".to_owned(),
+        server_tool_name: "delegate".to_owned(),
+        description: Some(
+            "Delegate a bounded task to a named Piqo agent using explicitly selected parent messages."
+                .to_owned(),
+        ),
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["agent", "task", "context_message_ids"],
+            "properties": {
+                "agent": {"type": "string"},
+                "task": {"type": "string"},
+                "context_message_ids": {"type": "array", "items": {"type": "string"}}
+            }
+        }),
+    }
 }
 
 fn native_tool_definitions(protocol: &ProviderProtocol, tools: &[NativeTool]) -> Vec<Value> {

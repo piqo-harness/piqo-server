@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{ContextProjection, PermissionDecision};
+use crate::{AgentLink, AgentResult, ContextProjection, DelegatedContextRef, PermissionDecision};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -128,10 +128,22 @@ pub struct PermissionProjection {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentProjection {
+    pub agent_id: String,
+    pub parent_id: Option<String>,
+    pub link: Option<AgentLink>,
+    pub config_revision: Option<u64>,
+    pub context: Vec<DelegatedContextRef>,
+    pub result: Option<AgentResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionProjection {
     pub state: SessionState,
     pub messages: Vec<MessageProjection>,
     pub agents: BTreeMap<String, AgentPhase>,
+    #[serde(default)]
+    pub agent_instances: BTreeMap<String, AgentProjection>,
     pub pending_permissions: BTreeMap<String, PermissionProjection>,
     pub runs: BTreeMap<String, RunProjection>,
     pub queue_paused: bool,
@@ -238,6 +250,7 @@ impl SessionProjection {
             state: SessionState::new(session_id),
             messages: Vec::new(),
             agents: BTreeMap::new(),
+            agent_instances: BTreeMap::new(),
             pending_permissions: BTreeMap::new(),
             runs: BTreeMap::new(),
             queue_paused: false,
@@ -323,7 +336,12 @@ impl SessionProjection {
                 message.interrupted = true;
                 message.last_event_id = event_id;
             }
-            crate::SemanticEvent::AgentSpawned { agent_id, .. } => {
+            crate::SemanticEvent::AgentSpawned {
+                agent_id,
+                parent_id,
+                link,
+                config_revision,
+            } => {
                 if self
                     .agents
                     .insert(agent_id.clone(), AgentPhase::Created)
@@ -331,12 +349,63 @@ impl SessionProjection {
                 {
                     return Err(ProjectionError::DuplicateAgent(agent_id.clone()));
                 }
+                self.agent_instances.insert(
+                    agent_id.clone(),
+                    AgentProjection {
+                        agent_id: agent_id.clone(),
+                        parent_id: parent_id.clone(),
+                        link: link.clone(),
+                        config_revision: *config_revision,
+                        context: Vec::new(),
+                        result: None,
+                    },
+                );
             }
             crate::SemanticEvent::AgentPhaseChanged { agent_id, phase } => {
                 self.agents.insert(agent_id.clone(), *phase);
             }
-            crate::SemanticEvent::AgentFinished { agent_id } => {
+            crate::SemanticEvent::AgentFinished { agent_id, result } => {
                 self.agents.insert(agent_id.clone(), AgentPhase::Finished);
+                let instance = self
+                    .agent_instances
+                    .get_mut(agent_id)
+                    .ok_or_else(|| ProjectionError::UnknownAgent(agent_id.clone()))?;
+                match (&instance.result, result) {
+                    (None, result) => instance.result = result.clone(),
+                    (Some(existing), Some(result)) if existing == result => {}
+                    (Some(_), Some(_)) => {
+                        return Err(ProjectionError::ConflictingAgentResult(agent_id.clone()))
+                    }
+                    _ => {}
+                }
+            }
+            crate::SemanticEvent::AgentContextCaptured {
+                agent_id,
+                references,
+            } => {
+                let instance = self
+                    .agent_instances
+                    .get_mut(agent_id)
+                    .ok_or_else(|| ProjectionError::UnknownAgent(agent_id.clone()))?;
+                if !instance.context.is_empty() && instance.context != *references {
+                    return Err(ProjectionError::ConflictingAgentContext(agent_id.clone()));
+                }
+                instance.context = references.clone();
+            }
+            crate::SemanticEvent::AgentResultDelivered {
+                agent_id, result, ..
+            } => {
+                let instance = self
+                    .agent_instances
+                    .get_mut(agent_id)
+                    .ok_or_else(|| ProjectionError::UnknownAgent(agent_id.clone()))?;
+                match &instance.result {
+                    None => instance.result = Some(result.clone()),
+                    Some(existing) if existing == result => {}
+                    Some(_) => {
+                        return Err(ProjectionError::ConflictingAgentResult(agent_id.clone()))
+                    }
+                }
             }
             crate::SemanticEvent::PermissionRequested {
                 request_id,
@@ -702,6 +771,12 @@ pub enum ProjectionError {
     MessageAlreadyClosed(String),
     #[error("agent {0} was spawned more than once")]
     DuplicateAgent(String),
+    #[error("agent {0} is unknown")]
+    UnknownAgent(String),
+    #[error("agent {0} already has a different terminal result")]
+    ConflictingAgentResult(String),
+    #[error("agent {0} already has different delegated context")]
+    ConflictingAgentContext(String),
     #[error("run {0} was queued more than once")]
     DuplicateRun(String),
     #[error("run {0} is unknown")]
@@ -894,5 +969,47 @@ mod tests {
             projection.apply(8, &conflict),
             Err(ProjectionError::ConflictingToolResult(_))
         ));
+    }
+
+    #[test]
+    fn projects_a_linked_agent_result_once() {
+        let mut projection = SessionProjection::new("parent");
+        projection
+            .apply(1, &crate::SemanticEvent::SessionCreated { title: None })
+            .expect("creation projects");
+        projection
+            .apply(
+                2,
+                &crate::SemanticEvent::AgentSpawned {
+                    agent_id: "instance".into(),
+                    parent_id: Some("parent-agent".into()),
+                    link: None,
+                    config_revision: Some(1),
+                },
+            )
+            .expect("agent projects");
+        let result = crate::AgentResult {
+            instance_id: "instance".into(),
+            profile_id: "researcher".into(),
+            child_session_id: "child".into(),
+            child_run_id: "run".into(),
+            status: crate::AgentTerminalStatus::Completed,
+            output: Some(serde_json::json!("done")),
+            output_truncated: false,
+            usage: None,
+            error: None,
+        };
+        let event = crate::SemanticEvent::AgentFinished {
+            agent_id: "instance".into(),
+            result: Some(result.clone()),
+        };
+        projection.apply(3, &event).expect("completion projects");
+        projection
+            .apply(4, &event)
+            .expect("same completion is idempotent");
+        assert_eq!(
+            projection.agent_instances["instance"].result.as_ref(),
+            Some(&result)
+        );
     }
 }
